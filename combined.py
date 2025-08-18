@@ -129,6 +129,9 @@ def run_flipme():
     date_groups = {}
     input_files = [f for f in script_root.glob("*.MP4")]
     for file in input_files:
+        if "-music" in file.name:
+            print(f"⏭️ Skipping {file.name} (contains '-music')")
+            continue
         date = get_date_from_name(file.name)
         date_groups.setdefault(date, []).append(file)
 
@@ -487,6 +490,10 @@ def generate_dummy_gopro_clips(
             ("2025-08-18", "06-30", "0732"),
             ("2025-08-18", "07-15", "0733"),
             ("2025-08-18", "07-30", "0734"),
+            ("2025-08-19", "05-56", "0735"),
+            ("2025-08-19", "06-31", "0736"),
+            ("2025-08-19", "07-16", "0737"),
+            ("2025-08-19", "07-31", "0738"),
         ]
 
     if camera_ids is None:
