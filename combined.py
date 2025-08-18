@@ -26,16 +26,18 @@ from datetime import datetime, UTC
 # CONFIGURATION
 # =========================
 FFMPEG_PATH = r"C:\Program Files (x86)\ffmpeg\ffmpeg.exe"
+SCRIPT_FOLDER = r"D:\Users\dylix\source\repos\GoPro"
+MUSIC_FOLDER = r"D:\GoPro\Music"
 VIDEO_FOLDER = r"D:\GoPro\today"
-CACHE_FILE = "playlist_cache.json"
+CACHE_FILE = os.path.join(SCRIPT_FOLDER, "playlist_cache.json")
 SEARCH_TERM = "royalty free"
 CONFIRM = True
 DELETE = True
 FLIP_FILES = False
 DELETE_ORIGINALS = True
 MAX_RATIO = 2.0
-CLIENT_SECRETS_FILE = "client_secrets.json"
-with open("config.json") as f:
+CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json") 
+with open(os.path.join(SCRIPT_FOLDER, "config.json")) as f:
     config = json.load(f)
 
 API_KEY = config["api_key"]
@@ -268,6 +270,8 @@ def get_limited_playlist_entries(playlist_url, max_duration_sec):
     with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
         entries = info.get('entries', [])
+        #shuffle entries so its less boring
+        random.shuffle(entries)
         print(f"Found {len(entries)} flat entries")
 
     ydl_opts_individual = {
@@ -390,7 +394,7 @@ def run_add_music(video_file):
     choice = int(input("Enter the number of the playlist you want to download: "))
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
-    DOWNLOAD_FOLDER = os.path.join(VIDEO_FOLDER, playlist_clean_name)
+    DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
     #download_playlist_as_mp3(selected['url'], DOWNLOAD_FOLDER)
     #download_playlist_as_mp3(selected['url'], DOWNLOAD_FOLDER, duration_sec)
     entry_urls = get_limited_playlist_entries(selected['url'], duration_sec)
@@ -577,7 +581,9 @@ if __name__ == "__main__":
                 print(f"🎬 You selected: {selected_file.name}")
                 playlist_title, final_video = run_add_music(selected_file)
                 if final_video:
-                    upload_video(final_video, playlist_title)
+                    choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
+                    if choice == "y":
+                        upload_video(final_video, playlist_title)
             except (ValueError, IndexError):
                 print("❌ Invalid selection. Exiting.")
                 exit()
@@ -596,5 +602,6 @@ if __name__ == "__main__":
     # Normal flow: music + upload
     playlist_title, final_video = run_add_music(video_file)
     if final_video:
-        upload_video(final_video, playlist_title)
-
+        choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
+        if choice == "y":
+            upload_video(final_video, playlist_title)
