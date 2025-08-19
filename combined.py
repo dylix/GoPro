@@ -654,6 +654,7 @@ def process_video_file(video_file):
 
 def process_all_new_files():
     print("🚀 Starting batch processing...")
+    video_file = run_flipme()
     candidates = [
         f for f in Path(VIDEO_FOLDER).glob("*.mp4")
         if not f.name.endswith("-music.mp4") and f.stat().st_size > 0
@@ -761,15 +762,18 @@ def show_popup():
 # =========================
 if __name__ == "__main__":
 
+    video_file = run_flipme()
+    if not video_file:
+        print("No combined video created.")
+
+
     # --- Start Alert Threads ---
     threading.Thread(target=sound_loop, daemon=True).start()
     if os.name == 'nt':
         threading.Thread(target=flash_window, daemon=True).start()
 
 
-    video_file = run_flipme()
-    if not video_file:
-        print("No combined video created.")
+
 
         # Fallback: look for MP4s that don't end in -music.mp4
         candidates = [
