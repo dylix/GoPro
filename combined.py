@@ -47,7 +47,7 @@ WATCH_EXTENSIONS = {'.mp4'}
 SETTLE_TIME = 900  # seconds
 CHECK_INTERVAL = 10  # seconds
 CACHE_FILE = os.path.join(SCRIPT_FOLDER, "playlist_cache.json")
-SEARCH_TERM = "royalty free"
+SEARCH_TERM = "royalty free edm"
 CONFIRM = True
 FLIP_FILES = False
 DELETE_ORIGINALS = True
@@ -66,6 +66,15 @@ if not API_KEY or "YOUR_API_KEY_HERE" in API_KEY:
 # =========================
 # STEP 1: FLIPME FUNCTIONS
 # =========================
+
+def delete_if_exists(file_path):
+    path = Path(file_path)
+    if path.exists():
+        print(f"🗑️ Deleting: {path.name}")
+        path.unlink()
+    else:
+        print(f"📁 File not found: {path.name}")
+
 def get_unique_name(filename):
     return filename[-8:-4]
 
@@ -124,7 +133,8 @@ def run_flipme():
                                 "-metadata:s:v", "rotate=180",
                                 "-codec", "copy", str(script_root / newname)
                             ])
-                            candidate.unlink()
+                            if DELETE_ORIGINALS:
+                                delete_if_exists(candidate)
                         else:
                             if not orig_name:
                                 orig_name = candidate.name
@@ -140,11 +150,8 @@ def run_flipme():
                 ])
                 if DELETE_ORIGINALS:
                     for name in combined_files:
-                        try:
-                            Path(script_root / name).unlink()
-                        except Exception as e:
-                            print(f"Failed to delete {name}: {e}")
-            filelist_path.unlink()
+                        delete_if_exists(script_root / name)
+            delete_if_exists(filelist_path)
 
     # Second pass: group by date
     date_groups = {}
@@ -182,13 +189,8 @@ def run_flipme():
             final_output = str(output_file)
             if DELETE_ORIGINALS:
                 for file in files:
-                    try:
-                        file.unlink()
-                        print(f"🗑️ Deleted: {file.name}")
-                    except Exception as e:
-                        print(f"⚠️ Failed to delete {file.name}: {e}")
-        list_file.unlink()
-
+                    delete_if_exists(file.name)
+        delete_if_exists(list_file)
     return final_output
 
 # =========================
@@ -412,7 +414,7 @@ def run_add_music(video_file):
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
     #choice = int(input(""))
     #choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝Enter your response within 30 seconds:", timeout=30)
-    choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝 Enter your response within 60 seconds:", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
+    choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
@@ -646,7 +648,7 @@ def process_video_file(video_file):
         if final_video:
             #choice = input("🛠️ Upload the video? This uses a lot of API daily credits. (y/n): ").strip().lower()
             #choice = input_with_timeout("🛠️ Upload the video? This uses a lot of API daily credits. (y/n):\n📝 Enter your response within 30 seconds:", timeout=30)
-            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30, require_input=True)
+            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=True)
             if choice == "y":
                 upload_video(final_video, playlist_title)
 
@@ -721,17 +723,16 @@ def flash_window():
 def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=None):
     attempt = 0
     while retries is None or attempt <= retries:
-        print(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'})")
         result = [None]
 
         def get_input():
             try:
-                user_input = input()
+                user_input = input(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
                 result[0] = cast_type(user_input)
-                stop_alerts.set()  # Stop alerts once input is received
+                stop_alerts.set()
             except Exception:
-                result[0] = default  # fallback if cast fails
-                stop_alerts.set()  # Stop alerts once input is received
+                result[0] = default
+                stop_alerts.set()
 
         thread = threading.Thread(target=get_input)
         thread.daemon = True
@@ -783,7 +784,7 @@ if __name__ == "__main__":
 
             #choice = input("Select a file to add music to (enter a number) or press enter to skip..")
             #choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..\n📝 Enter your response within 30 seconds:", timeout=30)
-            choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..:", timeout=30, require_input=True)
+            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=True)
             try:
                 index = int(choice) - 1
                 selected_file = candidates[index]
@@ -792,7 +793,7 @@ if __name__ == "__main__":
                 if final_video:
                     #choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
                     #choice = input_with_timeout("️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30)
-                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30, require_input=True)
+                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=True)
                     if choice == "y":
                         upload_video(final_video, playlist_title)
             except (ValueError, IndexError):
