@@ -720,28 +720,48 @@ def flash_window():
         ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
         time.sleep(5)
 
+
+# Shared flags
+stop_alerts = threading.Event()
+print_lock = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+
 # --- Timeout Logic ---
 def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=None):
     attempt = 0
     while retries is None or attempt <= retries:
         result = [None]
+        input_ready = threading.Event()
 
         def get_input():
+            input_ready.set()
             try:
-                user_input = input(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
+                user_input = input()
                 result[0] = cast_type(user_input)
-                stop_alerts.set()
             except Exception:
                 result[0] = default
-                stop_alerts.set()
+
+        # Suppress alerts and print prompt
+        stop_alerts.set()
+        with print_lock:
+            sys.stdout.write(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
+            sys.stdout.flush()
 
         thread = threading.Thread(target=get_input)
         thread.daemon = True
         thread.start()
+
+        # Wait for input thread to be ready
+        input_ready.wait(timeout=1.0)  # Increased to 1s to ensure readiness
+
         thread.join(timeout)
+        stop_alerts.clear()
 
         if thread.is_alive():
-            print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
+            safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
             attempt += 1
             if retries is not None and attempt > retries:
                 if require_input:
@@ -749,6 +769,8 @@ def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_
                 return default
         else:
             return result[0] if result[0] is not None else default
+
+
 
 # --- Optional Popup (cross-platform) ---
 def show_popup():
@@ -766,14 +788,10 @@ if __name__ == "__main__":
     if not video_file:
         print("No combined video created.")
 
-
     # --- Start Alert Threads ---
     threading.Thread(target=sound_loop, daemon=True).start()
     if os.name == 'nt':
         threading.Thread(target=flash_window, daemon=True).start()
-
-
-
 
         # Fallback: look for MP4s that don't end in -music.mp4
         candidates = [
