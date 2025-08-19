@@ -12,6 +12,7 @@ import yt_dlp
 import json
 import httplib2
 import http.client as httplib
+import threading
 
 from apiclient.discovery import build
 from apiclient.errors import HttpError
@@ -21,6 +22,19 @@ from oauth2client.file import Storage
 from oauth2client.tools import argparser, run_flow
 from pathlib import Path
 from datetime import datetime, UTC
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Optional: playsound or winsound depending on platform
+try:
+    from playsound import playsound
+except ImportError:
+    playsound = None
+
+# Windows-specific imports
+if os.name == 'nt':
+    import ctypes
+    import winsound
 
 # =========================
 # CONFIGURATION
@@ -29,21 +43,26 @@ FFMPEG_PATH = r"C:\Program Files (x86)\ffmpeg\ffmpeg.exe"
 SCRIPT_FOLDER = r"D:\Users\dylix\source\repos\GoPro"
 MUSIC_FOLDER = r"D:\GoPro\Music"
 VIDEO_FOLDER = r"D:\GoPro\today"
+WATCH_EXTENSIONS = {'.mp4'}
+SETTLE_TIME = 900  # seconds
+CHECK_INTERVAL = 10  # seconds
 CACHE_FILE = os.path.join(SCRIPT_FOLDER, "playlist_cache.json")
 SEARCH_TERM = "royalty free"
 CONFIRM = True
-DELETE = True
 FLIP_FILES = False
 DELETE_ORIGINALS = True
 MAX_RATIO = 2.0
-CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json") 
+CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json")
+
+last_event_time = time.time()
+
 with open(os.path.join(SCRIPT_FOLDER, "config.json")) as f:
     config = json.load(f)
-
 API_KEY = config["api_key"]
-
 if not API_KEY or "YOUR_API_KEY_HERE" in API_KEY:
     raise ValueError("Missing or placeholder API key in config.json.")
+
+
 # =========================
 # STEP 1: FLIPME FUNCTIONS
 # =========================
@@ -161,7 +180,7 @@ def run_flipme():
         if output_file.exists() and output_file.stat().st_size > 0:
             print(f"Output file {output_file.name} created successfully.")
             final_output = str(output_file)
-            if DELETE:
+            if DELETE_ORIGINALS:
                 for file in files:
                     try:
                         file.unlink()
@@ -391,7 +410,9 @@ def run_add_music(video_file):
     for i, p in enumerate(playlist_info, start=1):
         match_pct = (p['duration'] / duration_sec) * 100
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
-    choice = int(input("Enter the number of the playlist you want to download: "))
+    #choice = int(input(""))
+    #choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝Enter your response within 30 seconds:", timeout=30)
+    choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝 Enter your response within 60 seconds:", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
@@ -406,6 +427,7 @@ def run_add_music(video_file):
     print(f'Created {final_file} with music')
     save_cache(cache)
     return selected["title"], final_file
+
 
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
@@ -554,12 +576,197 @@ def generate_dummy_gopro_clips(
             print(f"✅ Created: {filepath.name} with mtime {date} {time}")
             cumulative_time += duration_sec
 
+
+# =========================
+# WATCHER STUFF
+# =========================
+
+def get_file_sizes():
+    return {
+        f: f.stat().st_size
+        for f in Path(VIDEO_FOLDER).glob("*.mp4")
+        if not f.name.endswith("-music.mp4")
+    }
+
+class SettlingHandler(FileSystemEventHandler):
+    def dispatch(self, event):
+        global last_event_time
+        if not event.is_directory:
+            ext = os.path.splitext(event.src_path)[1].lower()
+            if ext in WATCH_EXTENSIONS:
+                last_event_time = time.time()
+                print(f"📁 Event: {event.event_type.upper()} → {event.src_path}")
+
+def wait_for_settle():
+    print(f"⏳ Waiting for directory to settle...")
+    stable_start = None
+    previous_sizes = get_file_sizes()
+
+    while True:
+        time.sleep(CHECK_INTERVAL)
+
+        current_sizes = get_file_sizes()
+        changed_files = [
+            f for f in current_sizes
+            if current_sizes[f] != previous_sizes.get(f)
+        ]
+
+        if changed_files:
+            print("📏 File sizes changed:")
+            for f in changed_files:
+                old = previous_sizes.get(f, 0)
+                new = current_sizes[f]
+                print(f"   - {f.name}: {old} → {new}")
+            stable_start = None
+            previous_sizes = current_sizes
+            continue
+
+        if time.time() - last_event_time < SETTLE_TIME:
+            wait_time = int(time.time() - last_event_time)
+            print(f"🕒 Recent file event detected ({wait_time}s ago). Waiting...", end="\r")
+            stable_start = None
+            continue
+
+        if stable_start is None:
+            stable_start = time.time()
+            print("📦 File sizes stable. Starting settle timer...              ")
+
+        elif time.time() - stable_start >= SETTLE_TIME:
+            print("✅ Directory settled. No changes and stable sizes.           ")
+            break
+
+def process_video_file(video_file):
+    if not video_file:
+        print("No combined video created.")
+    else:
+        if has_music_version(video_file):
+            print(f"🎵 Skipping {video_file} — music version already exists.")
+            return
+        playlist_title, final_video = run_add_music(video_file)
+        if final_video:
+            #choice = input("🛠️ Upload the video? This uses a lot of API daily credits. (y/n): ").strip().lower()
+            #choice = input_with_timeout("🛠️ Upload the video? This uses a lot of API daily credits. (y/n):\n📝 Enter your response within 30 seconds:", timeout=30)
+            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30, require_input=True)
+            if choice == "y":
+                upload_video(final_video, playlist_title)
+
+def process_all_new_files():
+    print("🚀 Starting batch processing...")
+    candidates = [
+        f for f in Path(VIDEO_FOLDER).glob("*.mp4")
+        if not f.name.endswith("-music.mp4") and f.stat().st_size > 0
+    ]
+    for f in candidates:
+        print(f"🎬 Processing: {f.name}")
+        process_video_file(f)
+
+def start_watcher_then_process():
+    global last_event_time
+    observer = Observer()
+    observer.schedule(SettlingHandler(), path=VIDEO_FOLDER, recursive=False)
+    observer.start()
+
+    print(f"👀 Watching {VIDEO_FOLDER} for new files...")
+
+    try:
+        while True:
+            last_event_time = time.time()
+            wait_for_settle()  # Wait until files are stable
+            process_all_new_files()  # Trigger batch logic
+            print("🔁 Returning to watch mode...\n")
+    except KeyboardInterrupt:
+        print("❌ Watcher stopped by user.")
+    finally:
+        observer.stop()
+        observer.join()
+
+
+def has_music_version(file_path):
+    base, ext = os.path.splitext(file_path)
+    music_path = f"{base}-music{ext}"
+    return os.path.exists(music_path)
+
+# =========================
+# NOTIFICATION STUFF
+# =========================
+
+# --- Shared Stop Signal ---
+stop_alerts = threading.Event()
+
+# --- Sound Alert ---
+def sound_loop():
+    while not stop_alerts.is_set():
+        if os.name == 'nt':
+            winsound.Beep(1000, 500)
+        elif playsound:
+            playsound("alert.wav")
+        time.sleep(2)
+
+# --- Flash Window (Windows only) ---
+def flash_window():
+    FLASHW_ALL = 3
+    class FLASHWINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint),
+                    ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint)]
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, FLASHW_ALL, 5, 0)
+    while not stop_alerts.is_set():
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        time.sleep(5)
+
+# --- Timeout Logic ---
+def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=None):
+    attempt = 0
+    while retries is None or attempt <= retries:
+        print(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'})")
+        result = [None]
+
+        def get_input():
+            try:
+                user_input = input()
+                result[0] = cast_type(user_input)
+                stop_alerts.set()  # Stop alerts once input is received
+            except Exception:
+                result[0] = default  # fallback if cast fails
+                stop_alerts.set()  # Stop alerts once input is received
+
+        thread = threading.Thread(target=get_input)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+
+        if thread.is_alive():
+            print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
+            attempt += 1
+            if retries is not None and attempt > retries:
+                if require_input:
+                    raise TimeoutError("No input received after retries and no default provided.")
+                return default
+        else:
+            return result[0] if result[0] is not None else default
+
+# --- Optional Popup (cross-platform) ---
+def show_popup():
+    if os.name == 'nt':
+        os.system('msg * "Please respond to the script!"')
+    else:
+        os.system('zenity --info --text="Please respond to the script!"')
+
 # =========================
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
-    video_file = run_flipme()
 
+    # --- Start Alert Threads ---
+    threading.Thread(target=sound_loop, daemon=True).start()
+    if os.name == 'nt':
+        threading.Thread(target=flash_window, daemon=True).start()
+
+
+    video_file = run_flipme()
     if not video_file:
         print("No combined video created.")
 
@@ -574,22 +781,28 @@ if __name__ == "__main__":
             for i, f in enumerate(candidates, 1):
                 print(f"{i}. {f.name}")
 
-            choice = input("Select a file to add music to (enter number): ")
+            #choice = input("Select a file to add music to (enter a number) or press enter to skip..")
+            #choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..\n📝 Enter your response within 30 seconds:", timeout=30)
+            choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..:", timeout=30, require_input=True)
             try:
                 index = int(choice) - 1
                 selected_file = candidates[index]
                 print(f"🎬 You selected: {selected_file.name}")
                 playlist_title, final_video = run_add_music(selected_file)
                 if final_video:
-                    choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
+                    #choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
+                    #choice = input_with_timeout("️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30)
+                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30, require_input=True)
                     if choice == "y":
                         upload_video(final_video, playlist_title)
             except (ValueError, IndexError):
-                print("❌ Invalid selection. Exiting.")
+                print("❌ Invalid selection. Entering file watch mode..")
+                start_watcher_then_process()
                 exit()
         else:
             print("📁 No eligible MP4 files found.")
-            choice = input("🛠️ Would you like to generate dummy GoPro clips? (y/n): ").strip().lower()
+            #choice = input("🛠️ Would you like to generate dummy GoPro clips? (y/n): ").strip().lower()
+            choice = input_with_timeout("🛠️ Would you like to generate dummy GoPro clips? (y/n): ", timeout=10, default="n", cast_type=str).strip().lower()
             if choice == "y":
                 generate_dummy_gopro_clips(VIDEO_FOLDER)
                 mp4_files = sorted([f for f in Path(VIDEO_FOLDER).glob("*") if f.suffix.lower() == ".mp4"])
@@ -598,10 +811,8 @@ if __name__ == "__main__":
             else:
                 print("🚪 Exiting without generating clips.")
                 exit()
+    else:
+        process_video_file(video_file)
 
-    # Normal flow: music + upload
-    playlist_title, final_video = run_add_music(video_file)
-    if final_video:
-        choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
-        if choice == "y":
-            upload_video(final_video, playlist_title)
+    # 🔁 Start watching for new files after initial run
+    start_watcher_then_process()
