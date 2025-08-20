@@ -134,7 +134,7 @@ def run_flipme():
                                 "-codec", "copy", str(script_root / newname)
                             ])
                             if DELETE_ORIGINALS:
-                                delete_if_exists(candidate)
+                                delete_if_exists(script_root / candidate)
                         else:
                             if not orig_name:
                                 orig_name = candidate.name
@@ -189,7 +189,7 @@ def run_flipme():
             final_output = str(output_file)
             if DELETE_ORIGINALS:
                 for file in files:
-                    delete_if_exists(file.name)
+                    delete_if_exists(script_root / file.name)
         delete_if_exists(list_file)
     return final_output
 
@@ -415,6 +415,7 @@ def run_add_music(video_file):
     #choice = int(input(""))
     #choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝Enter your response within 30 seconds:", timeout=30)
     choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
+    stop_alerts.set()
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
@@ -427,6 +428,8 @@ def run_add_music(video_file):
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
     final_file = mix_audio_with_video(video_file, output_mp3)
     print(f'Created {final_file} with music')
+    if DELETE_ORIGINALS:
+        delete_if_exists(video_file)
     save_cache(cache)
     return selected["title"], final_file
 
@@ -648,7 +651,8 @@ def process_video_file(video_file):
         if final_video:
             #choice = input("🛠️ Upload the video? This uses a lot of API daily credits. (y/n): ").strip().lower()
             #choice = input_with_timeout("🛠️ Upload the video? This uses a lot of API daily credits. (y/n):\n📝 Enter your response within 30 seconds:", timeout=30)
-            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=True)
+            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="n")
+            stop_alerts.set()
             if choice == "y":
                 upload_video(final_video, playlist_title)
 
@@ -698,12 +702,10 @@ stop_alerts = threading.Event()
 
 # --- Sound Alert ---
 def sound_loop():
-    while not stop_alerts.is_set():
-        if os.name == 'nt':
-            winsound.Beep(1000, 500)
-        elif playsound:
-            playsound("alert.wav")
-        time.sleep(2)
+    while True:
+        if stop_alerts.wait(timeout=1.0):  # Wait until stop_alerts is set
+            break
+        winsound.Beep(1000, 500)
 
 # --- Flash Window (Windows only) ---
 def flash_window():
@@ -716,10 +718,10 @@ def flash_window():
                     ("dwTimeout", ctypes.c_uint)]
     hwnd = ctypes.windll.user32.GetForegroundWindow()
     info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, FLASHW_ALL, 5, 0)
-    while not stop_alerts.is_set():
+    while True:
+        if stop_alerts.wait(timeout=1.0):  # Wait until stop_alerts is set
+            break
         ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
-        time.sleep(5)
-
 
 # Shared flags
 stop_alerts = threading.Event()
@@ -730,46 +732,56 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 # --- Timeout Logic ---
-def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=None):
-    attempt = 0
-    while retries is None or attempt <= retries:
-        result = [None]
-        input_ready = threading.Event()
 
-        def get_input():
-            input_ready.set()
+def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
+    if require_input:
+        # Block until valid input is received
+        while True:
+            with print_lock:
+                sys.stdout.write(f"{prompt} (required): ")
+                sys.stdout.flush()
             try:
                 user_input = input()
-                result[0] = cast_type(user_input)
-            except Exception:
-                result[0] = default
+                return cast_type(user_input)
+            except Exception as e:
+                safe_print(f"\n⚠️ Invalid input: {e}. Please try again.")
+    else:
+        # Use timeout + fallback logic
+        attempt = 0
+        while retries is None or attempt <= retries:
+            result = [None]
+            input_ready = threading.Event()
 
-        # Suppress alerts and print prompt
-        stop_alerts.set()
-        with print_lock:
-            sys.stdout.write(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
-            sys.stdout.flush()
+            def get_input():
+                input_ready.set()
+                try:
+                    user_input = input()
+                    result[0] = cast_type(user_input)
+                except Exception as e:
+                    safe_print(f"\n⚠️ Input casting failed: {e}")
+                    result[0] = default
 
-        thread = threading.Thread(target=get_input)
-        thread.daemon = True
-        thread.start()
+            with print_lock:
+                sys.stdout.write(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
+                sys.stdout.flush()
 
-        # Wait for input thread to be ready
-        input_ready.wait(timeout=1.0)  # Increased to 1s to ensure readiness
+            thread = threading.Thread(target=get_input)
+            thread.daemon = True
+            thread.start()
 
-        thread.join(timeout)
-        stop_alerts.clear()
+            input_ready.wait(timeout=1.0)
+            thread.join(timeout)
 
-        if thread.is_alive():
-            safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
-            attempt += 1
-            if retries is not None and attempt > retries:
-                if require_input:
-                    raise TimeoutError("No input received after retries and no default provided.")
-                return default
-        else:
-            return result[0] if result[0] is not None else default
-
+            if thread.is_alive():
+                safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
+                thread.join(0.1)
+                attempt += 1
+                if retries is not None and attempt > retries:
+                    return default
+                elif retries is None:
+                    return default
+            else:
+                return result[0] if result[0] is not None else default
 
 
 # --- Optional Popup (cross-platform) ---
@@ -806,7 +818,8 @@ if __name__ == "__main__":
 
             #choice = input("Select a file to add music to (enter a number) or press enter to skip..")
             #choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..\n📝 Enter your response within 30 seconds:", timeout=30)
-            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=True)
+            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default="n")
+            stop_alerts.set()
             try:
                 index = int(choice) - 1
                 selected_file = candidates[index]
@@ -815,7 +828,8 @@ if __name__ == "__main__":
                 if final_video:
                     #choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
                     #choice = input_with_timeout("️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30)
-                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=True)
+                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="n")
+                    stop_alerts.set()
                     if choice == "y":
                         upload_video(final_video, playlist_title)
             except (ValueError, IndexError):
@@ -826,6 +840,7 @@ if __name__ == "__main__":
             print("📁 No eligible MP4 files found.")
             #choice = input("🛠️ Would you like to generate dummy GoPro clips? (y/n): ").strip().lower()
             choice = input_with_timeout("🛠️ Would you like to generate dummy GoPro clips? (y/n): ", timeout=10, default="n", cast_type=str).strip().lower()
+            stop_alerts.set()
             if choice == "y":
                 generate_dummy_gopro_clips(VIDEO_FOLDER)
                 mp4_files = sorted([f for f in Path(VIDEO_FOLDER).glob("*") if f.suffix.lower() == ".mp4"])
@@ -833,7 +848,6 @@ if __name__ == "__main__":
                 video_file = run_flipme()
             else:
                 print("🚪 Exiting without generating clips.")
-                exit()
     else:
         process_video_file(video_file)
 
