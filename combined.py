@@ -96,7 +96,7 @@ def run_flipme():
     script_root = Path(VIDEO_FOLDER)
     mp4_files = list(script_root.glob("*.mp4"))
     if not mp4_files:
-        print("No MP4 files found.")
+        #print("No MP4 files found.")
         return None
 
     # Group files
@@ -509,43 +509,38 @@ def upload_video(video_file, playlist_title, privacy_status="unlisted"):
 # Generates dummy GoPro-style videos with overlays and sets file modification times.
 # =========================
 
-def generate_dummy_gopro_clips(
-    output_dir=Path(VIDEO_FOLDER),
-    timestamps=None,
-    camera_ids=None,
-    duration_sec=10
-):
-    if timestamps is None:
-        timestamps = [
-            ("2025-08-18", "05-55", "0731"),
-            ("2025-08-18", "06-30", "0732"),
-            ("2025-08-18", "07-15", "0733"),
-            ("2025-08-18", "07-30", "0734"),
-            ("2025-08-19", "05-56", "0735"),
-            ("2025-08-19", "06-31", "0736"),
-            ("2025-08-19", "07-16", "0737"),
-            ("2025-08-19", "07-31", "0738"),
-        ]
+def generate_dummy_gopro_clips(output_dir):
+    timestamps = [
+        ("2025-08-18", "05-55", "0731"),
+        ("2025-08-18", "06-30", "0732"),
+        ("2025-08-18", "07-15", "0733"),
+        ("2025-08-18", "07-30", "0734"),
+        ("2025-08-19", "05-56", "0735"),
+        ("2025-08-19", "06-31", "0736"),
+        ("2025-08-19", "07-16", "0737"),
+        ("2025-08-19", "07-31", "0738"),
+    ]
 
-    if camera_ids is None:
-        camera_ids = ["1", "2", "3"]
+    camera_ids = ["1", "2", "3"]
+    duration_sec = 10
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     def create_dummy_video(filepath, start_time_sec, camera_id):
         filename = filepath.name
+        font_path = "C:/Windows/Fonts/arial.ttf"
 
         drawtext_filters = [
-            "drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':"
-            "fontsize=48:fontcolor=white:x=50:y=50:"
-            "text='%{pts\\:hms}'",
+            f"drawtext=fontfile='{font_path}':"
+            f"fontsize=48:fontcolor=white:x=50:y=50:"
+            f"text='%{{eif\\:t+{start_time_sec}\\:d}}'",
 
-            f"drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':"
+            f"drawtext=fontfile='{font_path}':"
             f"fontsize=36:fontcolor=yellow:x=50:y=120:"
             f"text='Camera ID\\: {camera_id}'",
 
-            f"drawtext=fontfile='C\\:/Windows/Fonts/arial.ttf':"
+            f"drawtext=fontfile='{font_path}':"
             f"fontsize=36:fontcolor=cyan:x=50:y=180:"
             f"text='File\\: {filename}'"
         ]
@@ -558,12 +553,13 @@ def generate_dummy_gopro_clips(
             "-f", "lavfi",
             "-i", "smptebars=size=1920x1080:rate=30",
             "-vf", vf_chain,
-            "-t", str(duration_sec),
+            "-t", "10",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             str(filepath)
         ]
         subprocess.run(cmd)
+
 
     def set_mtime(filepath, date_str, time_str):
         dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H-%M")
@@ -580,7 +576,6 @@ def generate_dummy_gopro_clips(
             set_mtime(filepath, date, time)
             print(f"✅ Created: {filepath.name} with mtime {date} {time}")
             cumulative_time += duration_sec
-
 
 # =========================
 # WATCHER STUFF
@@ -642,7 +637,8 @@ def wait_for_settle():
 
 def process_video_file(video_file):
     if not video_file:
-        print("No combined video created.")
+        #print("No combined video created.")
+        return
     else:
         if has_music_version(video_file):
             print(f"🎵 Skipping {video_file} — music version already exists.")
@@ -797,8 +793,6 @@ def show_popup():
 if __name__ == "__main__":
 
     video_file = run_flipme()
-    if not video_file:
-        print("No combined video created.")
 
     # --- Start Alert Threads ---
     threading.Thread(target=sound_loop, daemon=True).start()
