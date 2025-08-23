@@ -24,6 +24,7 @@ from pathlib import Path
 from datetime import datetime, UTC
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from pydub import AudioSegment
 
 # Optional: playsound or winsound depending on platform
 try:
@@ -311,10 +312,8 @@ def get_limited_playlist_entries(playlist_url, max_duration_sec):
                 video_info = ydl.extract_info(url, download=False)
                 duration = video_info.get('duration', 0)
                 print(f"✓ {title} — {duration:.1f}s")
-                if cumulative_duration + duration > max_duration_sec:
-                    cumulative_duration += duration
-                    selected_entries.append(url)
-                    print(f"⏹ Stopping at {cumulative_duration:.1f}s (limit: {max_duration_sec}s)")
+                if cumulative_duration >= max_duration_sec:
+                    print(f"⏹ Reached target duration: {cumulative_duration:.1f}s")
                     break
                 cumulative_duration += duration
                 selected_entries.append(url)
@@ -323,8 +322,6 @@ def get_limited_playlist_entries(playlist_url, max_duration_sec):
 
     print(f"✅ Selected {len(selected_entries)} tracks totaling {cumulative_duration:.1f} seconds")
     return selected_entries
-
-
 
 def download_playlist_as_mp3(entry_urls, output_path):
     os.makedirs(output_path, exist_ok=True)
@@ -340,8 +337,24 @@ def download_playlist_as_mp3(entry_urls, output_path):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download(entry_urls)
 
+def get_total_audio_duration(file_list):
+    total_duration = 0
+    for file in file_list:
+        try:
+            audio = AudioSegment.from_file(file)
+            duration = len(audio) / 1000  # seconds
+            print(f"✅ {file}: {duration:.2f}s")
+            total_duration += duration
+        except Exception as e:
+            print(f"⚠️ Skipping {file}: {e}")
+    print(f"🎯 Total audio duration: {total_duration/60:.2f} minutes")
+    return total_duration
 
 def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
+    mp3_files = [os.path.join(mp3_folder, f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+    actual_duration = get_total_audio_duration(mp3_files)
+    print(f"🧮 Actual total audio duration: {actual_duration/60:.2f} minutes")
+
     mp3_files = [f for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
     filelist_path = os.path.join(mp3_folder, 'filelist.txt')
     with open(filelist_path, 'w', encoding='utf-8') as filelist:
@@ -737,7 +750,7 @@ def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_
                 sys.stdout.write(f"{prompt} (required): ")
                 sys.stdout.flush()
             try:
-                user_input = input()
+                user_input = input().strip()
                 return cast_type(user_input)
             except Exception as e:
                 safe_print(f"\n⚠️ Invalid input: {e}. Please try again.")
