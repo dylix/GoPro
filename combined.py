@@ -312,7 +312,6 @@ def get_playlist_duration(api_key, playlist_id, cache):
     }
     return total_seconds
 
-
 def fetch_video_durations(video_ids, api_key, cache=None):
     durations = {}
     uncached_ids = [vid for vid in video_ids if not cache or vid not in cache]
@@ -340,8 +339,6 @@ def fetch_video_durations(video_ids, api_key, cache=None):
                 durations[vid] = cache[vid]
 
     return durations
-
-
 
 def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=None):
     cumulative_duration = 0
@@ -384,20 +381,71 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
     print(f"✅ Selected {len(selected_entries)} tracks totaling {cumulative_duration:.1f} seconds")
     return selected_entries
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def download_single_mp3(url, output_path, archive_path):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': f'{output_path}/%(title)s.%(ext)s',
+        'ignoreerrors': True,
+        'download_archive': archive_path,
+        'overwriteskip': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': True,
+        'no_warnings': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        return f"✅ Downloaded: {url}"
+    except Exception as e:
+        return f"❌ Failed: {url} — {e}"
+
+def download_playlist_parallel(entry_urls, output_path, max_workers=4):
+    os.makedirs(output_path, exist_ok=True)
+    archive_path = os.path.join(output_path, "archive.txt")
+
+    print(f"🚀 Starting parallel download with {max_workers} workers...")
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_single_mp3, url, output_path, archive_path) for url in entry_urls]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    print("🎧 Download complete:")
+    for r in results:
+        print(r)
+
 
 def download_playlist_as_mp3(entry_urls, output_path):
     os.makedirs(output_path, exist_ok=True)
+
+    archive_path = os.path.join(output_path, "archive.txt")
 
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': f'{output_path}/%(title)s.%(ext)s',
         'ignoreerrors': True,
-        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
-        'quiet': True, 'no_warnings': True,
+        'download_archive': archive_path,
+        'overwriteskip': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': True,
+        'no_warnings': True,
     }
 
+    print(f"🎧 Starting MP3 download for {len(entry_urls)} entries...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download(entry_urls)
+    print(f"✅ MP3 download complete. Archive saved to: {archive_path}")
 
 def get_total_audio_duration(file_list):
     total_duration = 0
@@ -462,12 +510,18 @@ def mix_audio_with_video(video_file, new_audio_file):
     subprocess.run(command, check=True)
     return output_file
 
-
-def sanitize_filename(filename, replacement="_"):
+def sanitize_filename(filename, replacement=""):
     name, ext = os.path.splitext(filename)
+    # Remove unwanted characters
     name = re.sub(r"[^a-zA-Z0-9 _-]", replacement, name)
-    name = re.sub(rf"{re.escape(replacement)}+", replacement, name).strip(f" {replacement}")
-    if not name: name = "untitled"
+    # Only collapse and strip if replacement is non-empty
+    if replacement:
+        name = re.sub(rf"{re.escape(replacement)}+", replacement, name)
+        name = name.strip(" _-")
+    else:
+        name = name.strip()
+    if not name:
+        name = "untitled"
     return f"{name}{ext}"
 
 def run_add_music(video_file):
@@ -495,7 +549,8 @@ def run_add_music(video_file):
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
     entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, cache)
-    download_playlist_as_mp3(entry_urls, DOWNLOAD_FOLDER)
+    #download_playlist_as_mp3(entry_urls, DOWNLOAD_FOLDER)
+    download_playlist_parallel(entry_urls, output_path, max_workers=8)
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
     delete_if_exists(output_mp3)
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
