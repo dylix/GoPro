@@ -14,6 +14,7 @@ import httplib2
 import http.client as httplib
 import threading
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from apiclient.discovery import build
 from apiclient.errors import HttpError
 from apiclient.http import MediaFileUpload
@@ -340,9 +341,10 @@ def fetch_video_durations(video_ids, api_key, cache=None):
 
     return durations
 
-def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=None):
+def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=None, buffer_sec=30):
     cumulative_duration = 0
     selected_entries = []
+    target_duration = max_duration_sec + buffer_sec
 
     print(f"Fetching flat playlist entries from: {playlist_url}")
     ydl_opts = {
@@ -358,30 +360,70 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
         print(f"Found {len(entries)} flat entries")
 
     video_ids = [e.get('id') for e in entries if e.get('id')]
-    durations = fetch_video_durations(video_ids, api_key, cache)
+    uncached_ids = [vid for vid in video_ids if not cache or vid not in cache]
 
+    # Fetch durations via YouTube API
+    if uncached_ids:
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        for i in range(0, len(uncached_ids), 50):
+            batch_ids = uncached_ids[i:i+50]
+            params = {
+                "part": "contentDetails",
+                "id": ",".join(batch_ids),
+                "key": api_key
+            }
+            resp = requests.get(url, params=params)
+            resp.raise_for_status()
+            for item in resp.json().get("items", []):
+                vid = item["id"]
+                dur = iso8601_duration_to_seconds(item["contentDetails"]["duration"])
+                if cache is not None:
+                    cache[vid] = dur
+
+    # Select entries and download as needed
     for entry in entries:
         vid = entry.get('id')
         url = entry.get('url')
         title = entry.get('title', 'unknown')
-        duration = durations.get(vid, 0)
+        duration = cache.get(vid, 0)
 
         if not url or duration == 0:
             print(f"⚠️ Skipping {title} (missing URL or duration)")
             continue
 
-        if cumulative_duration + duration > max_duration_sec:
-            print(f"⏹ Reached target duration: {cumulative_duration:.1f}s")
-            break
+        filename = sanitize_filename(f"{title}.mp3")
+        if os.path.exists(filename):
+            print(f"✅ Already downloaded: {filename}")
+        else:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': filename,
+                'quiet': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                print(f"⬇️ Downloaded: {filename}")
+            except Exception as e:
+                print(f"❌ Failed to download {title}: {e}")
+                continue
 
         cumulative_duration += duration
         selected_entries.append(url)
-        print(f"✓ {title} — {duration:.1f}s")
+        print(f"✓ {title} — {duration:.1f}s → Total: {cumulative_duration:.1f}s")
 
-    print(f"✅ Selected {len(selected_entries)} tracks totaling {cumulative_duration:.1f} seconds")
+        if cumulative_duration > target_duration:
+            print(f"✅ Target exceeded: {cumulative_duration:.1f}s > {target_duration:.1f}s")
+            break
+
     return selected_entries
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 def download_single_mp3(url, output_path, archive_path):
     ydl_opts = {
@@ -550,7 +592,7 @@ def run_add_music(video_file):
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
     entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, cache)
     #download_playlist_as_mp3(entry_urls, DOWNLOAD_FOLDER)
-    download_playlist_parallel(entry_urls, output_path, max_workers=8)
+    download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
     delete_if_exists(output_mp3)
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
