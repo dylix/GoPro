@@ -228,16 +228,48 @@ def has_audio_stream(video_path):
     ], capture_output=True, text=True)
     return bool(result.stdout.strip())
 
-def get_video_duration(filepath):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", filepath],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-    )
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        return 0.0
+def get_video_duration(video_file):
+    import subprocess
+
+    def run_ffprobe(args):
+        try:
+            result = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=True
+            )
+            output = result.stdout.decode().strip()
+            return float(output)
+        except Exception as e:
+            print(f"⚠️ ffprobe failed with args {args}: {e}")
+            return None
+
+    # Try stream-level duration (more precise)
+    stream_args = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_file
+    ]
+    duration = run_ffprobe(stream_args)
+
+    # Fallback to format-level duration
+    if duration is None or duration < 1:
+        format_args = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_file
+        ]
+        duration = run_ffprobe(format_args)
+
+    if duration is None:
+        raise ValueError(f"❌ Could not determine duration for {video_file}")
+
+    print(f"⏱️ Duration of {video_file}: {duration:.2f} seconds")
+    return duration
 
 def search_youtube_playlists(api_key, query, max_results=5):
     url = "https://www.googleapis.com/youtube/v3/search"
@@ -399,7 +431,10 @@ def mix_audio_with_video(video_file, new_audio_file):
     base, ext = os.path.splitext(video_file)
     output_file = f"{base}-music{ext}"
     duration = get_video_duration(video_file)
-
+    video_duration = get_video_duration(video_file)
+    audio_duration = get_video_duration(new_audio_file)
+    print(f"🎬 Video duration: {video_duration:.1f}s")
+    print(f"🎵 Audio duration: {audio_duration:.1f}s")
     if has_audio_stream(video_file):
         filter_complex = (
             f"[0:a]atrim=duration={duration}[a0];"
