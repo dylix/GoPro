@@ -341,10 +341,12 @@ def fetch_video_durations(video_ids, api_key, cache=None):
 
     return durations
 
-def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=None, buffer_sec=30):
+def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, download_folder, cache=None, buffer_sec=30):
     cumulative_duration = 0
     selected_entries = []
     target_duration = max_duration_sec + buffer_sec
+
+    os.makedirs(download_folder, exist_ok=True)
 
     print(f"Fetching flat playlist entries from: {playlist_url}")
     ydl_opts = {
@@ -380,7 +382,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
                 if cache is not None:
                     cache[vid] = dur
 
-    # Select entries and download as needed
+    # Select entries and download into download_folder
     for entry in entries:
         vid = entry.get('id')
         url = entry.get('url')
@@ -392,12 +394,14 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
             continue
 
         filename = sanitize_filename(f"{title}.mp3")
-        if os.path.exists(filename):
-            print(f"✅ Already downloaded: {filename}")
+        full_path = os.path.join(download_folder, filename)
+
+        if os.path.exists(full_path):
+            print(f"✅ Already downloaded: {full_path}")
         else:
             ydl_opts = {
                 'format': 'bestaudio/best',
-                'outtmpl': filename,
+                'outtmpl': full_path,
                 'quiet': True,
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -408,7 +412,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
-                print(f"⬇️ Downloaded: {filename}")
+                print(f"⬇️ Downloaded: {full_path}")
             except Exception as e:
                 print(f"❌ Failed to download {title}: {e}")
                 continue
@@ -422,6 +426,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=
             break
 
     return selected_entries
+
 
 
 
@@ -590,8 +595,7 @@ def run_add_music(video_file):
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
-    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, cache)
-    #download_playlist_as_mp3(entry_urls, DOWNLOAD_FOLDER)
+    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, DOWNLOAD_FOLDER, cache, buffer_sec=30)
     download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
     delete_if_exists(output_mp3)
@@ -980,8 +984,6 @@ if __name__ == "__main__":
             for i, f in enumerate(candidates, 1):
                 print(f"{i}. {f.name}")
 
-            #choice = input("Select a file to add music to (enter a number) or press enter to skip..")
-            #choice = input_with_timeout("📝 Select a file to add music to (enter a number) or press enter to skip..\n📝 Enter your response within 30 seconds:", timeout=30)
             choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default="n")
             stop_alerts.set()
             try:
@@ -990,8 +992,6 @@ if __name__ == "__main__":
                 print(f"🎬 You selected: {selected_file.name}")
                 playlist_title, final_video = run_add_music(selected_file)
                 if final_video:
-                    #choice = input("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ").strip().lower()
-                    #choice = input_with_timeout("️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n):", timeout=30)
                     choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="n")
                     stop_alerts.set()
                     if choice == "y":
@@ -1002,7 +1002,6 @@ if __name__ == "__main__":
                 exit()
         else:
             print("📁 No eligible MP4 files found.")
-            #choice = input("🛠️ Would you like to generate dummy GoPro clips? (y/n): ").strip().lower()
             choice = input_with_timeout("🛠️ Would you like to generate dummy GoPro clips? (y/n): ", timeout=10, default="n", cast_type=str).strip().lower()
             stop_alerts.set()
             if choice == "y":
