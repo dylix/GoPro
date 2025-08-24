@@ -247,81 +247,111 @@ def search_youtube_playlists(api_key, query, max_results=5):
     return resp.json().get("items", [])
 
 def get_playlist_duration(api_key, playlist_id, cache):
-    if playlist_id in cache:
+    if playlist_id in cache and "duration" in cache[playlist_id]:
         return cache[playlist_id]["duration"]
-    total_seconds = 0
+
+    video_ids = []
     page_token = None
     while True:
         url = "https://www.googleapis.com/youtube/v3/playlistItems"
-        params = {"part": "contentDetails", "playlistId": playlist_id, "maxResults": 5, "key": api_key}
+        params = {
+            "part": "contentDetails",
+            "playlistId": playlist_id,
+            "maxResults": 50,
+            "key": api_key
+        }
         if page_token:
             params["pageToken"] = page_token
         resp = requests.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
-        video_ids = [i["contentDetails"]["videoId"] for i in data.get("items", [])]
-        if not video_ids: break
-        url_vid = "https://www.googleapis.com/youtube/v3/videos"
-        params_vid = {"part": "contentDetails", "id": ",".join(video_ids), "key": api_key}
-        resp_vid = requests.get(url_vid, params=params_vid)
-        videos = resp_vid.json().get("items", [])
-        for v in videos:
-            total_seconds += iso8601_duration_to_seconds(v["contentDetails"]["duration"])
+        video_ids.extend([i["contentDetails"]["videoId"] for i in data.get("items", [])])
         page_token = data.get("nextPageToken")
-        if not page_token: break
-        
-        cache[playlist_id] = {
-            "title": "",  # optional, can be filled later
-            "duration": total_seconds,
-            "cached_at": datetime.now(UTC).isoformat()
-        }
+        if not page_token:
+            break
+
+    durations = fetch_video_durations(video_ids, api_key, cache)
+    total_seconds = sum(durations.values())
+
+    cache[playlist_id] = {
+        "title": "",  # optional
+        "duration": total_seconds,
+        "cached_at": datetime.now(UTC).isoformat()
+    }
     return total_seconds
 
-def get_limited_playlist_entries(playlist_url, max_duration_sec):
+
+def fetch_video_durations(video_ids, api_key, cache=None):
+    durations = {}
+    uncached_ids = [vid for vid in video_ids if not cache or vid not in cache]
+
+    if uncached_ids:
+        url = "https://www.googleapis.com/youtube/v3/videos"
+        params = {
+            "part": "contentDetails",
+            "id": ",".join(uncached_ids),
+            "key": api_key
+        }
+        resp = requests.get(url, params=params)
+        resp.raise_for_status()
+        for item in resp.json().get("items", []):
+            vid = item["id"]
+            dur = iso8601_duration_to_seconds(item["contentDetails"]["duration"])
+            durations[vid] = dur
+            if cache is not None:
+                cache[vid] = dur
+
+    # Merge cached durations
+    if cache:
+        for vid in video_ids:
+            if vid in cache:
+                durations[vid] = cache[vid]
+
+    return durations
+
+
+
+def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, cache=None):
     cumulative_duration = 0
     selected_entries = []
 
     print(f"Fetching flat playlist entries from: {playlist_url}")
-
-    ydl_opts_flat = {
+    ydl_opts = {
         'quiet': True,
         'extract_flat': True,
         'skip_download': True,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts_flat) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
         entries = info.get('entries', [])
-        #shuffle entries so its less boring
         random.shuffle(entries)
         print(f"Found {len(entries)} flat entries")
 
-    ydl_opts_individual = {
-        'quiet': True,
-        'skip_download': True,
-    }
+    video_ids = [e.get('id') for e in entries if e.get('id')]
+    durations = fetch_video_durations(video_ids, api_key, cache)
 
-    with yt_dlp.YoutubeDL(ydl_opts_individual) as ydl:
-        for entry in entries:
-            url = entry.get('url')
-            title = entry.get('title', 'unknown')
-            if not url:
-                print(f"Skipping entry with no URL: {title}")
-                continue
-            try:
-                video_info = ydl.extract_info(url, download=False)
-                duration = video_info.get('duration', 0)
-                print(f"✓ {title} — {duration:.1f}s")
-                if cumulative_duration >= max_duration_sec:
-                    print(f"⏹ Reached target duration: {cumulative_duration:.1f}s")
-                    break
-                cumulative_duration += duration
-                selected_entries.append(url)
-            except Exception as e:
-                print(f"⚠️ Failed to fetch {url}: {e}")
+    for entry in entries:
+        vid = entry.get('id')
+        url = entry.get('url')
+        title = entry.get('title', 'unknown')
+        duration = durations.get(vid, 0)
+
+        if not url or duration == 0:
+            print(f"⚠️ Skipping {title} (missing URL or duration)")
+            continue
+
+        if cumulative_duration + duration > max_duration_sec:
+            print(f"⏹ Reached target duration: {cumulative_duration:.1f}s")
+            break
+
+        cumulative_duration += duration
+        selected_entries.append(url)
+        print(f"✓ {title} — {duration:.1f}s")
 
     print(f"✅ Selected {len(selected_entries)} tracks totaling {cumulative_duration:.1f} seconds")
     return selected_entries
+
 
 def download_playlist_as_mp3(entry_urls, output_path):
     os.makedirs(output_path, exist_ok=True)
@@ -415,7 +445,6 @@ def run_add_music(video_file):
     for pl in playlists:
         pl_id = pl["id"]["playlistId"]
         title = pl["snippet"]["title"]
-        #duration = get_playlist_duration(API_KEY, pl_id)
         duration = get_playlist_duration(API_KEY, pl_id, cache)
         if duration_sec <= duration: # and duration <= duration_sec * MAX_RATIO:
             diff = abs(duration - duration_sec)
@@ -425,19 +454,15 @@ def run_add_music(video_file):
     for i, p in enumerate(playlist_info, start=1):
         match_pct = (p['duration'] / duration_sec) * 100
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
-    #choice = int(input(""))
-    #choice = input_with_timeout("📝 Enter the number of the playlist you want to download:\n📝Enter your response within 30 seconds:", timeout=30)
     choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
     stop_alerts.set()
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
-    #download_playlist_as_mp3(selected['url'], DOWNLOAD_FOLDER)
-    #download_playlist_as_mp3(selected['url'], DOWNLOAD_FOLDER, duration_sec)
-    entry_urls = get_limited_playlist_entries(selected['url'], duration_sec)
+    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, cache)
     download_playlist_as_mp3(entry_urls, DOWNLOAD_FOLDER)
-    #output_mp3 = 'merged_playlist.mp3'
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
+    delete_if_exists(output_mp3)
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
     final_file = mix_audio_with_video(video_file, output_mp3)
     print(f'Created {final_file} with music')
