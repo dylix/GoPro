@@ -282,7 +282,6 @@ def search_youtube_playlists(api_key, query, max_results=5):
 def get_playlist_duration(api_key, playlist_id, cache):
     if playlist_id in cache and "duration" in cache[playlist_id]:
         return cache[playlist_id]["duration"]
-
     video_ids = []
     page_token = None
     while True:
@@ -313,25 +312,31 @@ def get_playlist_duration(api_key, playlist_id, cache):
     }
     return total_seconds
 
+def chunkify(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
 def fetch_video_durations(video_ids, api_key, cache=None):
     durations = {}
     uncached_ids = [vid for vid in video_ids if not cache or vid not in cache]
 
     if uncached_ids:
         url = "https://www.googleapis.com/youtube/v3/videos"
-        params = {
-            "part": "contentDetails",
-            "id": ",".join(uncached_ids),
-            "key": api_key
-        }
-        resp = requests.get(url, params=params)
-        resp.raise_for_status()
-        for item in resp.json().get("items", []):
-            vid = item["id"]
-            dur = iso8601_duration_to_seconds(item["contentDetails"]["duration"])
-            durations[vid] = dur
-            if cache is not None:
-                cache[vid] = dur
+        for chunk in chunkify(uncached_ids, 50):
+            params = {
+                "part": "contentDetails",
+                "id": ",".join(chunk),
+                "key": api_key
+            }
+            resp = requests.get(url, params=params)
+            resp.raise_for_status()
+
+            for item in resp.json().get("items", []):
+                vid = item["id"]
+                dur = iso8601_duration_to_seconds(item["contentDetails"]["duration"])
+                durations[vid] = dur
+                if cache is not None:
+                    cache[vid] = dur
 
     # Merge cached durations
     if cache:
@@ -340,6 +345,7 @@ def fetch_video_durations(video_ids, api_key, cache=None):
                 durations[vid] = cache[vid]
 
     return durations
+
 
 def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, download_folder, cache=None, buffer_sec=30):
     cumulative_duration = 0
@@ -590,7 +596,8 @@ def run_add_music(video_file):
     for i, p in enumerate(playlist_info, start=1):
         match_pct = (p['duration'] / duration_sec) * 100
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
-    choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=1, cast_type=int, require_input=False, retries=0)
+    default_choice = random.randint(1, len(playlist_info))
+    choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=default_choice, cast_type=int, require_input=False, retries=0)
     stop_alerts.set()
     selected = playlist_info[choice-1]
     playlist_clean_name = sanitize_filename(selected["title"])
@@ -821,7 +828,7 @@ def process_video_file(video_file):
         if final_video:
             #choice = input("🛠️ Upload the video? This uses a lot of API daily credits. (y/n): ").strip().lower()
             #choice = input_with_timeout("🛠️ Upload the video? This uses a lot of API daily credits. (y/n):\n📝 Enter your response within 30 seconds:", timeout=30)
-            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="n")
+            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
             stop_alerts.set()
             if choice == "y":
                 upload_video(final_video, playlist_title)
