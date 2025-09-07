@@ -46,7 +46,7 @@ SCRIPT_FOLDER = r"D:\Users\dylix\source\repos\GoPro"
 MUSIC_FOLDER = r"D:\GoPro\Music"
 VIDEO_FOLDER = r"D:\GoPro\today"
 WATCH_EXTENSIONS = {'.mp4'}
-SETTLE_TIME = 900  # seconds
+SETTLE_TIME = 300  # seconds
 CHECK_INTERVAL = 10  # seconds
 CACHE_FILE = os.path.join(SCRIPT_FOLDER, "playlist_cache.json")
 SEARCH_TERM = "royalty free edm"
@@ -514,18 +514,27 @@ def get_total_audio_duration(file_list):
     return total_duration
 
 def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
-    mp3_files = [os.path.join(mp3_folder, f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
-    actual_duration = get_total_audio_duration(mp3_files)
+    # Collect and shuffle MP3 files
+    mp3_files = [f for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+    random.shuffle(mp3_files)
+
+    # Optional: audit duration before shuffle (if you want to keep this)
+    full_paths = [os.path.join(mp3_folder, f) for f in mp3_files]
+    actual_duration = get_total_audio_duration(full_paths)
     print(f"🧮 Actual total audio duration: {actual_duration/60:.2f} minutes")
 
-    mp3_files = [f for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+    # Write shuffled file list for ffmpeg
     filelist_path = os.path.join(mp3_folder, 'filelist.txt')
     with open(filelist_path, 'w', encoding='utf-8') as filelist:
         for mp3 in mp3_files:
             path = os.path.join(mp3_folder, mp3).replace('\\', '/')
             safe_path = path.replace("'", "'\\''")
             filelist.write(f"file '{safe_path}'\n")
+
+    # Merge with ffmpeg
     subprocess.run(['ffmpeg','-f','concat','-safe','0','-i',filelist_path,'-c','copy',output_mp3], check=True)
+
+    # Cleanup
     os.remove(filelist_path)
 
 def mix_audio_with_video(video_file, new_audio_file):
@@ -972,7 +981,6 @@ def show_popup():
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
-
     video_file = run_flipme()
 
     # --- Start Alert Threads ---
@@ -991,7 +999,7 @@ if __name__ == "__main__":
             for i, f in enumerate(candidates, 1):
                 print(f"{i}. {f.name}")
 
-            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default="n")
+            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default=1)
             stop_alerts.set()
             try:
                 index = int(choice) - 1
@@ -999,7 +1007,7 @@ if __name__ == "__main__":
                 print(f"🎬 You selected: {selected_file.name}")
                 playlist_title, final_video = run_add_music(selected_file)
                 if final_video:
-                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="n")
+                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
                     stop_alerts.set()
                     if choice == "y":
                         upload_video(final_video, playlist_title)
