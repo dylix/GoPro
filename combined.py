@@ -272,7 +272,7 @@ def get_video_duration(video_file):
     print(f"⏱️ Duration of {video_file}: {duration:.2f} seconds")
     return duration
 
-def search_youtube_playlists(api_key, query, max_results=5):
+def search_youtube_playlists(api_key, query, max_results=49):
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {"part": "snippet", "q": query, "type": "playlist", "maxResults": max_results, "key": api_key}
     resp = requests.get(url, params=params)
@@ -719,19 +719,19 @@ def generate_dummy_gopro_clips(output_dir):
 
     def create_dummy_video(filepath, start_time_sec, camera_id):
         filename = filepath.name
-        font_path = "C:/Windows/Fonts/arial.ttf"
 
+        # Build drawtext overlays
         drawtext_filters = [
-            f"drawtext=fontfile='{font_path}':"
-            f"fontsize=48:fontcolor=white:x=50:y=50:"
+            # Timestamp overlay (centered at top)
+            "drawtext=fontsize=48:fontcolor=white:x=(w-text_w)/2:y=50:"
             f"text='%{{eif\\:t+{start_time_sec}\\:d}}'",
 
-            f"drawtext=fontfile='{font_path}':"
-            f"fontsize=36:fontcolor=yellow:x=50:y=120:"
+            # Camera ID overlay
+            f"drawtext=fontsize=36:fontcolor=yellow:x=50:y=120:"
             f"text='Camera ID\\: {camera_id}'",
 
-            f"drawtext=fontfile='{font_path}':"
-            f"fontsize=36:fontcolor=cyan:x=50:y=180:"
+            # Filename overlay
+            f"drawtext=fontsize=36:fontcolor=cyan:x=50:y=180:"
             f"text='File\\: {filename}'"
         ]
 
@@ -741,14 +741,17 @@ def generate_dummy_gopro_clips(output_dir):
             "ffmpeg",
             "-y",
             "-f", "lavfi",
-            "-i", "smptebars=size=1920x1080:rate=30",
+            "-i", "color=c=gray:size=1920x1080:rate=30",
             "-vf", vf_chain,
             "-t", "10",
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             str(filepath)
         ]
-        subprocess.run(cmd)
+
+        print("\nRunning FFmpeg command:\n", " ".join(cmd), "\n")
+        subprocess.run(cmd, check=True)
+
 
 
     def set_mtime(filepath, date_str, time_str):
@@ -998,10 +1001,9 @@ if __name__ == "__main__":
             print("\n🎵 Available MP4 files:")
             for i, f in enumerate(candidates, 1):
                 print(f"{i}. {f.name}")
-
-            choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default=1)
-            stop_alerts.set()
             try:
+                choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default=1)
+                stop_alerts.set()
                 index = int(choice) - 1
                 selected_file = candidates[index]
                 print(f"🎬 You selected: {selected_file.name}")
