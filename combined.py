@@ -26,6 +26,7 @@ from datetime import datetime, UTC
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pydub import AudioSegment
+from mutagen.mp3 import MP3
 
 # Optional: playsound or winsound depending on platform
 try:
@@ -94,9 +95,41 @@ def get_unique_filename(base_name):
         counter += 1
     return base
 
+def extract_timestamp_key(filename):
+    # Assumes format like '2025-10-09-07-31-48-GX010835.MP4'
+    parts = filename.split('-GX')
+    if len(parts) > 1:
+        return parts[0]  # returns '2025-10-09-07-31-48'
+    return filename  # fallback
+
+def is_valid_mp4(filepath):
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error", "-i", str(filepath),
+            "-show_format", "-show_streams"
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Error validating {filepath}: {e}")
+        return False
+
+
 def run_flipme():
     script_root = Path(VIDEO_FOLDER)
-    mp4_files = list(script_root.glob("*.mp4"))
+    all_files = list(script_root.glob("*.mp4"))
+    mp4_files = []
+
+    for f in all_files:
+        if is_valid_mp4(f):
+            mp4_files.append(f)
+        else:
+            print(f"🗑️ Deleting invalid file: {f.name}")
+            try:
+                f.unlink()
+            except Exception as e:
+                print(f"⚠️ Failed to delete {f.name}: {e}")
+
+    print(f"✅ Valid MP4 files: {[f.name for f in mp4_files]}")
     if not mp4_files:
         #print("No MP4 files found.")
         return None
@@ -104,9 +137,8 @@ def run_flipme():
     # Group files
     grouped = {}
     for file in mp4_files:
-        key = get_unique_name(file.name)
+        key = extract_timestamp_key(file.name)
         grouped.setdefault(key, []).append(file)
-
     processed_patterns = set()
     for group in grouped.values():
         group.sort(key=lambda f: f.stat().st_mtime, reverse=True)
@@ -359,6 +391,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
         'quiet': True,
         'extract_flat': True,
         'skip_download': True,
+        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -414,6 +447,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
+                "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
             }
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -448,11 +482,14 @@ def download_single_mp3(url, output_path, archive_path):
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False,
+        'no_warnings': False,
+        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
     }
 
     try:
+        print(ydl_opts)
+        print(url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         return f"✅ Downloaded: {url}"
@@ -474,32 +511,6 @@ def download_playlist_parallel(entry_urls, output_path, max_workers=4):
     for r in results:
         print(r)
 
-
-def download_playlist_as_mp3(entry_urls, output_path):
-    os.makedirs(output_path, exist_ok=True)
-
-    archive_path = os.path.join(output_path, "archive.txt")
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f'{output_path}/%(title)s.%(ext)s',
-        'ignoreerrors': True,
-        'download_archive': archive_path,
-        'overwriteskip': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'quiet': True,
-        'no_warnings': True,
-    }
-
-    print(f"🎧 Starting MP3 download for {len(entry_urls)} entries...")
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download(entry_urls)
-    print(f"✅ MP3 download complete. Archive saved to: {archive_path}")
-
 def get_total_audio_duration(file_list):
     total_duration = 0
     for file in file_list:
@@ -513,6 +524,7 @@ def get_total_audio_duration(file_list):
     print(f"🎯 Total audio duration: {total_duration/60:.2f} minutes")
     return total_duration
 
+#'''
 def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
     # Collect and shuffle MP3 files
     mp3_files = [f for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
@@ -536,6 +548,32 @@ def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
 
     # Cleanup
     os.remove(filelist_path)
+'''
+def merge_mp3s_and_cleanup(mp3_paths, output_mp3):
+    if not mp3_paths:
+        print("⚠️ No MP3 files provided for merging.")
+        return
+
+    # Shuffle the list
+    random.shuffle(mp3_paths)
+
+    # Optional: audit duration
+    actual_duration = get_total_audio_duration(mp3_paths)
+    print(f"🧮 Actual total audio duration: {actual_duration / 60:.2f} minutes")
+
+    # Write file list for ffmpeg
+    filelist_path = os.path.join(os.path.dirname(output_mp3), 'filelist.txt')
+    with open(filelist_path, 'w', encoding='utf-8') as filelist:
+        for path in mp3_paths:
+            safe_path = path.replace('\\', '/').replace("'", "'\\''")
+            filelist.write(f"file '{safe_path}'\n")
+
+    # Merge with ffmpeg
+    subprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0', '-i', filelist_path, '-c', 'copy', output_mp3], check=True)
+
+    # Cleanup
+    os.remove(filelist_path)
+'''
 
 def mix_audio_with_video(video_file, new_audio_file):
     base, ext = os.path.splitext(video_file)
@@ -586,6 +624,7 @@ def sanitize_filename(filename, replacement=""):
         name = "untitled"
     return f"{name}{ext}"
 
+#'''
 def run_add_music(video_file):
     if not video_file: return None, None
     duration_sec = get_video_duration(video_file)
@@ -622,7 +661,69 @@ def run_add_music(video_file):
         delete_if_exists(video_file)
     save_cache(cache)
     return selected["title"], final_file
+'''
+def run_add_music(video_file):
+    if not video_file:
+        return None, None
 
+    duration_sec = get_video_duration(video_file)
+    print(f"🎬 Duration of video: {duration_sec / 60:.1f} mins")
+
+    music_folder = r"D:\GoPro\Music"
+    mp3_files = []
+    for root, _, files in os.walk(music_folder):
+        for f in files:
+            if f.lower().endswith(".mp3"):
+                mp3_files.append(os.path.join(root, f))
+
+
+    if not mp3_files:
+        print("⚠️ No MP3 files found in local music folder.")
+        return None, None
+
+    mp3_info = []
+    for root, _, files in os.walk(music_folder):
+        for f in files:
+            if f.lower().endswith(".mp3"):
+                path = os.path.join(root, f)
+                try:
+                    audio = MP3(path)
+                    mp3_info.append({
+                        "path": path,
+                        "duration": audio.info.length  # seconds
+                    })
+                except Exception as e:
+                    print(f"❌ Failed to read {path}: {e}")
+
+    # Shuffle before selection
+    random.shuffle(mp3_info)
+
+    # Select MP3s to match video duration
+    selected_mp3s = []
+    total = 0
+    for track in mp3_info:
+        if total + track["duration"] <= duration_sec + 30:  # allow small buffer
+            selected_mp3s.append(track["path"])
+            total += track["duration"]
+        if total >= duration_sec:
+            break
+
+    print(f"🎵 Selected {len(selected_mp3s)} tracks totaling {total / 60:.1f} mins")
+
+    # Merge selected MP3s
+    output_mp3 = os.path.join(music_folder, "combined_local_music.mp3")
+    delete_if_exists(output_mp3)
+    merge_mp3s_and_cleanup(selected_mp3s, output_mp3)
+
+    # Mix with video
+    final_file = mix_audio_with_video(video_file, output_mp3)
+    print(f"✅ Created {final_file} with local music")
+
+    #if DELETE_ORIGINALS:
+    #    delete_if_exists(video_file)
+
+    return "Local MP3 Mix", final_file
+'''
 
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
@@ -701,14 +802,14 @@ def upload_video(video_file, playlist_title, privacy_status="unlisted"):
 
 def generate_dummy_gopro_clips(output_dir):
     timestamps = [
-        ("2025-08-18", "05-55", "0731"),
-        ("2025-08-18", "06-30", "0732"),
-        ("2025-08-18", "07-15", "0733"),
-        ("2025-08-18", "07-30", "0734"),
-        ("2025-08-19", "05-56", "0735"),
-        ("2025-08-19", "06-31", "0736"),
-        ("2025-08-19", "07-16", "0737"),
-        ("2025-08-19", "07-31", "0738"),
+        ("2025-08-18", "05-55-12", "0731"),
+        ("2025-08-18", "06-30-14", "0732"),
+        ("2025-08-18", "07-15-16", "0733"),
+        ("2025-08-18", "07-30-18", "0734"),
+        ("2025-08-19", "05-56-11", "0735"),
+        ("2025-08-19", "06-31-13", "0736"),
+        ("2025-08-19", "07-16-15", "0737"),
+        ("2025-08-19", "07-31-17", "0738"),
     ]
 
     camera_ids = ["1", "2", "3"]
@@ -755,7 +856,7 @@ def generate_dummy_gopro_clips(output_dir):
 
 
     def set_mtime(filepath, date_str, time_str):
-        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H-%M")
+        dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H-%M-%S")
         mod_time = dt.timestamp()
         os.utime(filepath, (mod_time, mod_time))
 
@@ -984,6 +1085,9 @@ def show_popup():
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
+    #upload_video(r"D:\GoPro\today\combined-2025-09-20-07-03-music.mp4", "Dubstep  [No Copyright Sound] [ FREE USE MUSIC ]")
+    #print("exiting")
+    #exit()
     video_file = run_flipme()
 
     # --- Start Alert Threads ---
