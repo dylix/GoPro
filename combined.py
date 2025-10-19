@@ -44,8 +44,8 @@ if os.name == 'nt':
 # =========================
 FFMPEG_PATH = r"C:\Program Files (x86)\ffmpeg\ffmpeg.exe"
 SCRIPT_FOLDER = r"D:\Users\dylix\source\repos\GoPro"
-MUSIC_FOLDER = r"D:\GoPro\Music"
-VIDEO_FOLDER = r"D:\GoPro\today"
+MUSIC_FOLDER = r"G:\GoPro\Music"
+VIDEO_FOLDER = r"G:\GoPro\Today"
 WATCH_EXTENSIONS = {'.mp4'}
 SETTLE_TIME = 300  # seconds
 CHECK_INTERVAL = 10  # seconds
