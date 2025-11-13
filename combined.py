@@ -13,7 +13,10 @@ import json
 import httplib2
 import http.client as httplib
 import threading
+import wmi
+import pythoncom
 
+from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from apiclient.discovery import build
 from apiclient.errors import HttpError
@@ -391,7 +394,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
         'quiet': True,
         'extract_flat': True,
         'skip_download': True,
-        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
+        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -447,7 +450,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
+                "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
             }
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -484,7 +487,7 @@ def download_single_mp3(url, output_path, archive_path):
         }],
         'quiet': False,
         'no_warnings': False,
-        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"]}},
+        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
     }
 
     try:
@@ -661,69 +664,7 @@ def run_add_music(video_file):
         delete_if_exists(video_file)
     save_cache(cache)
     return selected["title"], final_file
-'''
-def run_add_music(video_file):
-    if not video_file:
-        return None, None
 
-    duration_sec = get_video_duration(video_file)
-    print(f"🎬 Duration of video: {duration_sec / 60:.1f} mins")
-
-    music_folder = r"D:\GoPro\Music"
-    mp3_files = []
-    for root, _, files in os.walk(music_folder):
-        for f in files:
-            if f.lower().endswith(".mp3"):
-                mp3_files.append(os.path.join(root, f))
-
-
-    if not mp3_files:
-        print("⚠️ No MP3 files found in local music folder.")
-        return None, None
-
-    mp3_info = []
-    for root, _, files in os.walk(music_folder):
-        for f in files:
-            if f.lower().endswith(".mp3"):
-                path = os.path.join(root, f)
-                try:
-                    audio = MP3(path)
-                    mp3_info.append({
-                        "path": path,
-                        "duration": audio.info.length  # seconds
-                    })
-                except Exception as e:
-                    print(f"❌ Failed to read {path}: {e}")
-
-    # Shuffle before selection
-    random.shuffle(mp3_info)
-
-    # Select MP3s to match video duration
-    selected_mp3s = []
-    total = 0
-    for track in mp3_info:
-        if total + track["duration"] <= duration_sec + 30:  # allow small buffer
-            selected_mp3s.append(track["path"])
-            total += track["duration"]
-        if total >= duration_sec:
-            break
-
-    print(f"🎵 Selected {len(selected_mp3s)} tracks totaling {total / 60:.1f} mins")
-
-    # Merge selected MP3s
-    output_mp3 = os.path.join(music_folder, "combined_local_music.mp3")
-    delete_if_exists(output_mp3)
-    merge_mp3s_and_cleanup(selected_mp3s, output_mp3)
-
-    # Mix with video
-    final_file = mix_audio_with_video(video_file, output_mp3)
-    print(f"✅ Created {final_file} with local music")
-
-    #if DELETE_ORIGINALS:
-    #    delete_if_exists(video_file)
-
-    return "Local MP3 Mix", final_file
-'''
 
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
@@ -957,6 +898,58 @@ def process_all_new_files():
         print(f"🎬 Processing: {f.name}")
         process_video_file(f)
 
+
+# --- Helper: Copy GoPro files with progress ---
+def copy_with_progress(src, dst, buffer_size=1024*1024):
+    total_size = os.path.getsize(src)
+    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst, tqdm(
+        total=total_size,
+        unit='B',
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=os.path.basename(src)
+    ) as pbar:
+        while True:
+            buf = fsrc.read(buffer_size)
+            if not buf:
+                break
+            fdst.write(buf)
+            pbar.update(len(buf))
+    shutil.copystat(src, dst)  # preserve metadata
+
+def copy_gopro_files(drive_letter):
+    mount_point = f"{drive_letter}:\\"
+    for root, _, files in os.walk(mount_point):
+        for file in files:
+            name_upper = file.upper()
+            # Match .mp4 files that contain "GX" or "GOPR" anywhere in the name
+            if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
+                src = os.path.join(root, file)
+                dst = os.path.join(VIDEO_FOLDER, file)
+                if not os.path.exists(dst):
+                    print(f"📥 Starting copy: {src} -> {dst}")
+                    try:
+                        copy_with_progress(src, dst)
+                        print(f"✅ Finished copying {file}")
+                    except Exception as e:
+                        print(f"⚠️ Error copying {src}: {e}")
+
+# --- USB Listener Thread ---
+def usb_listener():
+    pythoncom.CoInitialize()  # COM init required in threads
+    c = wmi.WMI()
+    watcher = c.watch_for(
+        notification_type="Creation",
+        wmi_class="Win32_VolumeChangeEvent"
+    )
+    while True:
+        event = watcher()
+        if event.EventType == 2:  # Device arrival
+            drive_letter = event.DriveName.strip(":\\")
+            print(f"💽 USB inserted: {drive_letter}:\\")
+            copy_gopro_files(drive_letter)
+
+# --- Your Watchdog Loop ---
 def start_watcher_then_process():
     global last_event_time
     observer = Observer()
@@ -965,17 +958,23 @@ def start_watcher_then_process():
 
     print(f"👀 Watching {VIDEO_FOLDER} for new files...")
 
+    # Run USB listener in parallel
+    threading.Thread(target=usb_listener, daemon=True).start()
+
     try:
         while True:
             last_event_time = time.time()
-            wait_for_settle()  # Wait until files are stable
-            process_all_new_files()  # Trigger batch logic
+            wait_for_settle()          # Your existing settle logic
+            process_all_new_files()    # Your batch processing logic
             print("🔁 Returning to watch mode...\n")
     except KeyboardInterrupt:
         print("❌ Watcher stopped by user.")
     finally:
         observer.stop()
         observer.join()
+
+
+## END USB DRIVE MOD
 
 
 def has_music_version(file_path):
