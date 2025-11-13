@@ -721,7 +721,7 @@ def upload_video(video_file, playlist_title, privacy_status="unlisted"):
     args = Namespace(
         file=video_file,
         title=Path(video_file).stem,
-        description=f"Raw GoPro footage with music automatically added from {playlist_title} and then uploaded.",
+        description=f"Raw GoPro footage with music automatically added from '{playlist_title}' and then uploaded.",
         category="22",  # People & Blogs
         privacyStatus=privacy_status,
         logging_level="ERROR",
@@ -898,7 +898,6 @@ def process_all_new_files():
         print(f"🎬 Processing: {f.name}")
         process_video_file(f)
 
-
 # --- Helper: Copy GoPro files with progress ---
 def copy_with_progress(src, dst, buffer_size=1024*1024):
     total_size = os.path.getsize(src)
@@ -963,19 +962,19 @@ def start_watcher_then_process():
 
     try:
         while True:
-            last_event_time = time.time()
-            wait_for_settle()          # Your existing settle logic
-            process_all_new_files()    # Your batch processing logic
-            print("🔁 Returning to watch mode...\n")
+            if last_event_time:  # only run if handler saw an event
+                wait_for_settle()          # settle logic
+                process_all_new_files()    # batch processing
+                print("🔁 Returning to watch mode...\n")
+                last_event_time = None     # reset so we don't re-trigger
+            else:
+                time.sleep(1)  # idle quietly until an event occurs
     except KeyboardInterrupt:
         print("❌ Watcher stopped by user.")
     finally:
         observer.stop()
         observer.join()
-
-
 ## END USB DRIVE MOD
-
 
 def has_music_version(file_path):
     base, ext = os.path.splitext(file_path)
