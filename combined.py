@@ -1,4 +1,8 @@
 #!/usr/bin/python3
+
+#pip install --upgrade yt-dlp --pre
+
+
 import argparse
 import os
 import re
@@ -671,10 +675,11 @@ def run_add_music(video_file):
 # =========================
 httplib2.RETRIES = 1
 MAX_RETRIES = 10
-RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError, httplib.NotConnected,
-    httplib.IncompleteRead, httplib.ImproperConnectionState,
-    httplib.CannotSendRequest, httplib.CannotSendHeader,
-    httplib.ResponseNotReady, httplib.BadStatusLine,)
+#RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError, httplib.NotConnected,
+#    httplib.IncompleteRead, httplib.ImproperConnectionState,
+#    httplib.CannotSendRequest, httplib.CannotSendHeader,
+#    httplib.ResponseNotReady, httplib.BadStatusLine,)
+RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError)
 RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_API_SERVICE_NAME = "youtube"
@@ -697,22 +702,35 @@ def initialize_upload(youtube, options):
     resumable_upload(insert_request)
 
 def resumable_upload(insert_request):
-    response = None; error = None; retry = 0
+    response = None
+    error = None
+    retry = 0
     while response is None:
         try:
             print("Uploading file...")
             status, response = insert_request.next_chunk()
-            if response and "id" in response:
-                print("Video id '%s' was successfully uploaded." % response["id"])
-                return
+            if response is not None:
+                if 'id' in response:
+                    print("Video id 'https://youtu.be/%s' was successfully uploaded." % response['id'])
+                else:
+                    exit("The upload failed with an unexpected response: %s" % response)
         except HttpError as e:
-            if e.resp.status in RETRIABLE_STATUS_CODES: error = f"Retriable HTTP error {e.resp.status}"
-            else: raise
-        except RETRIABLE_EXCEPTIONS as e: error = f"Retriable error: {e}"
-        if error:
+            if e.resp.status in RETRIABLE_STATUS_CODES:
+                error = "A retriable HTTP error %d occurred:\n%s" % (e.resp.status, e.content)
+            else:
+                raise
+        except RETRIABLE_EXCEPTIONS as e:
+            error = "A retriable error occurred: %s" % e
+
+        if error is not None:
+            print(error)
             retry += 1
-            if retry > MAX_RETRIES: sys.exit("No longer attempting to retry.")
-            sleep_seconds = random.random() * (2**retry)
+            if retry > MAX_RETRIES:
+                exit("No longer attempting to retry.")
+
+            max_sleep = 2 ** retry
+            sleep_seconds = random.random() * max_sleep
+            print("Sleeping %f seconds and then retrying..." % sleep_seconds)
             time.sleep(sleep_seconds)
 
 def upload_video(video_file, playlist_title, privacy_status="unlisted"):
@@ -916,12 +934,24 @@ def copy_with_progress(src, dst, buffer_size=1024*1024):
             pbar.update(len(buf))
     shutil.copystat(src, dst)  # preserve metadata
 
+def find_sidecars(root, mp4_name):
+    sidecars = []
+    # Extract numeric sequence from MP4 filename
+    match = re.search(r"\d{4,}", mp4_name)
+    if match:
+        num = match.group(0)
+        for f in os.listdir(root):
+            if f.upper().endswith((".THM", ".LRV")) and num in f:
+                sidecars.append(os.path.join(root, f))
+    return sidecars
+
 def copy_gopro_files(drive_letter):
     mount_point = f"{drive_letter}:\\"
+    files_to_delete = []
+
     for root, _, files in os.walk(mount_point):
         for file in files:
             name_upper = file.upper()
-            # Match .mp4 files that contain "GX" or "GOPR" anywhere in the name
             if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
                 src = os.path.join(root, file)
                 dst = os.path.join(VIDEO_FOLDER, file)
@@ -929,9 +959,69 @@ def copy_gopro_files(drive_letter):
                     print(f"📥 Starting copy: {src} -> {dst}")
                     try:
                         copy_with_progress(src, dst)
-                        print(f"✅ Finished copying {file}")
+                        if os.path.getsize(src) == os.path.getsize(dst):
+                            print(f"✅ Finished copying {file}, marking for deletion")
+                            files_to_delete.append(src)
+                            # find and queue matching THM/LRV by numeric ID
+                            files_to_delete.extend(find_sidecars(root, file))
+                        else:
+                            print(f"⚠️ Size mismatch for {file}, not deleting")
                     except Exception as e:
                         print(f"⚠️ Error copying {src}: {e}")
+
+    if DELETE_ORIGINALS and files_to_delete:
+        print(f"🗑️ Deleting {len(files_to_delete)} files from USB...")
+        for f in set(files_to_delete):  # deduplicate
+            try:
+                os.remove(f)
+                print(f"   Removed {f}")
+            except Exception as e:
+                print(f"⚠️ Could not delete {f}: {e}")
+    elif not DELETE_ORIGINALS and files_to_delete:
+        print(f"ℹ️ {len(files_to_delete)} files verified, but not deleted (DELETE_ORIGINALS=False)")
+
+"""
+def copy_gopro_files(drive_letter):
+    mount_point = f"{drive_letter}:\\"
+    files_to_delete = []  # collect verified files for batch removal
+
+    for root, _, files in os.walk(mount_point):
+        for file in files:
+            name_upper = file.upper()
+            if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
+                src = os.path.join(root, file)
+                dst = os.path.join(VIDEO_FOLDER, file)
+                if not os.path.exists(dst):
+                    print(f"📥 Starting copy: {src} -> {dst}")
+                    try:
+                        copy_with_progress(src, dst)
+                        # ✅ Lightweight verification: compare file sizes
+                        if os.path.getsize(src) == os.path.getsize(dst):
+                            print(f"✅ Finished copying {file}, marking for deletion")
+                            # add MP4 and its sidecar files (.THM, .LRV) to delete list
+                            files_to_delete.append(src)
+                            base, _ = os.path.splitext(src)
+                            for ext in [".THM", ".LRV"]:
+                                sidecar = base + ext
+                                if os.path.exists(sidecar):
+                                    files_to_delete.append(sidecar)
+                        else:
+                            print(f"⚠️ Size mismatch for {file}, not deleting")
+                    except Exception as e:
+                        print(f"⚠️ Error copying {src}: {e}")
+
+    # --- Batch delete after all copies are done ---
+    if DELETE_ORIGINALS and files_to_delete:
+        print(f"🗑️ Deleting {len(files_to_delete)} files from USB...")
+        for f in files_to_delete:
+            try:
+                os.remove(f)
+                print(f"   Removed {f}")
+            except Exception as e:
+                print(f"⚠️ Could not delete {f}: {e}")
+    elif not DELETE_ORIGINALS and files_to_delete:
+        print(f"ℹ️ {len(files_to_delete)} files verified, but not deleted (DELETE_ORIGINALS=False)")
+"""
 
 # --- USB Listener Thread ---
 def usb_listener():
