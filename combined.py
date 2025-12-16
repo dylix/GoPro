@@ -23,12 +23,6 @@ import socket
 import pyperclip
 
 #from argparse import Namespace
-
-CLIENT_SECRETS_FILE = "client_secrets.json"
-YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
-YOUTUBE_API_SERVICE_NAME = "youtube"
-YOUTUBE_API_VERSION = "v3"
-
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 #from apiclient.discovery import build
@@ -80,7 +74,9 @@ DELETE_ORIGINALS = True
 MAX_RATIO = 2.0
 CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json")
 TOKEN_FILE = os.path.join(SCRIPT_FOLDER, "token.json")
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_API_SERVICE_NAME = "youtube"
+YOUTUBE_API_VERSION = "v3"
 
 last_event_time = time.time()
 
@@ -745,13 +741,13 @@ def run_add_music(video_file):
 def get_authenticated_service():
     creds = None
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, YOUTUBE_UPLOAD_SCOPE)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, YOUTUBE_UPLOAD_SCOPE)
             creds = flow.run_local_server(port=8080)
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
