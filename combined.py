@@ -19,12 +19,21 @@ import http.client as httplib
 import threading
 import wmi
 import pythoncom
+import socket
+import pyperclip
+
+#from argparse import Namespace
+
+CLIENT_SECRETS_FILE = "client_secrets.json"
+YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_API_SERVICE_NAME = "youtube"
+YOUTUBE_API_VERSION = "v3"
 
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from apiclient.discovery import build
-from apiclient.errors import HttpError
-from apiclient.http import MediaFileUpload
+#from apiclient.discovery import build
+#from apiclient.errors import HttpError
+#from apiclient.http import MediaFileUpload
 from oauth2client.client import flow_from_clientsecrets
 from oauth2client.file import Storage
 from oauth2client.tools import argparser, run_flow
@@ -34,6 +43,13 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pydub import AudioSegment
 from mutagen.mp3 import MP3
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 # Optional: playsound or winsound depending on platform
 try:
@@ -63,6 +79,8 @@ FLIP_FILES = False
 DELETE_ORIGINALS = True
 MAX_RATIO = 2.0
 CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json")
+TOKEN_FILE = os.path.join(SCRIPT_FOLDER, "token.json")
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 last_event_time = time.time()
 
@@ -474,9 +492,6 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
 
     return selected_entries
 
-
-
-
 def download_single_mp3(url, output_path, archive_path):
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -518,20 +533,62 @@ def download_playlist_parallel(entry_urls, output_path, max_workers=4):
     for r in results:
         print(r)
 
-def get_total_audio_duration(file_list):
-    total_duration = 0
-    for file in file_list:
-        try:
-            audio = AudioSegment.from_file(file)
-            duration = len(audio) / 1000  # seconds
-            print(f"✅ {file}: {duration:.2f}s")
-            total_duration += duration
-        except Exception as e:
-            print(f"⚠️ Skipping {file}: {e}")
-    print(f"🎯 Total audio duration: {total_duration/60:.2f} minutes")
-    return total_duration
+# NEW
 
-#'''
+def fast_audio_duration(file):
+    """Return duration in seconds using ffprobe metadata."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=True
+        )
+        return float(result.stdout.strip())
+    except Exception as e:
+        print(f"⚠️ Failed to probe {file}: {e}")
+        return 0.0
+
+def get_total_audio_duration(file_list, workers=8):
+    """Audit audio durations quickly using parallel ffprobe calls."""
+    total = 0.0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fast_audio_duration, f): f for f in file_list}
+        for future in as_completed(futures):
+            dur = future.result()
+            f = futures[future]
+            if dur > 0:
+                print(f"✅ {f}: {dur:.2f}s")
+                total += dur
+    print(f"🎯 Total audio duration: {total/60:.2f} minutes")
+    return total
+
+def ensure_audio_matches_video(video_file, mp3_folder, api_key, playlist_url, cache, buffer_sec=30):
+    """
+    Ensure audio duration >= video duration.
+    If short, download more tracks until target is met.
+    """
+    video_duration = fast_audio_duration(video_file)
+    mp3_files = [str(Path(mp3_folder) / f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+    total_audio = get_total_audio_duration(mp3_files)
+
+    if total_audio + buffer_sec < video_duration:
+        print(f"⚠️ Audio too short ({total_audio:.1f}s vs video {video_duration:.1f}s). Fetching more tracks...")
+        # Call get_limited_playlist_entries again to top up
+        extra_urls = get_limited_playlist_entries(api_key, playlist_url,
+                                                  video_duration - total_audio,
+                                                  mp3_folder, cache, buffer_sec=buffer_sec)
+        download_playlist_parallel(extra_urls, mp3_folder, max_workers=8)
+        # Recalculate after top‑up
+        mp3_files = [str(Path(mp3_folder) / f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+        total_audio = get_total_audio_duration(mp3_files)
+
+    return total_audio
+
 def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
     # Collect and shuffle MP3 files
     mp3_files = [f for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
@@ -555,32 +612,6 @@ def merge_mp3s_and_cleanup(mp3_folder, output_mp3):
 
     # Cleanup
     os.remove(filelist_path)
-'''
-def merge_mp3s_and_cleanup(mp3_paths, output_mp3):
-    if not mp3_paths:
-        print("⚠️ No MP3 files provided for merging.")
-        return
-
-    # Shuffle the list
-    random.shuffle(mp3_paths)
-
-    # Optional: audit duration
-    actual_duration = get_total_audio_duration(mp3_paths)
-    print(f"🧮 Actual total audio duration: {actual_duration / 60:.2f} minutes")
-
-    # Write file list for ffmpeg
-    filelist_path = os.path.join(os.path.dirname(output_mp3), 'filelist.txt')
-    with open(filelist_path, 'w', encoding='utf-8') as filelist:
-        for path in mp3_paths:
-            safe_path = path.replace('\\', '/').replace("'", "'\\''")
-            filelist.write(f"file '{safe_path}'\n")
-
-    # Merge with ffmpeg
-    subprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0', '-i', filelist_path, '-c', 'copy', output_mp3], check=True)
-
-    # Cleanup
-    os.remove(filelist_path)
-'''
 
 def mix_audio_with_video(video_file, new_audio_file):
     base, ext = os.path.splitext(video_file)
@@ -633,127 +664,215 @@ def sanitize_filename(filename, replacement=""):
 
 #'''
 def run_add_music(video_file):
-    if not video_file: return None, None
+    if not video_file: 
+        return None, None
+
     duration_sec = get_video_duration(video_file)
     print(f"Duration of combined video: {duration_sec/60:.1f} mins")
+
     playlists = search_youtube_playlists(API_KEY, SEARCH_TERM)
     playlist_info = []
     cache = load_cache()
+
     for pl in playlists:
         pl_id = pl["id"]["playlistId"]
         title = pl["snippet"]["title"]
         duration = get_playlist_duration(API_KEY, pl_id, cache)
-        if duration_sec <= duration: # and duration <= duration_sec * MAX_RATIO:
+        if duration_sec <= duration:  # and duration <= duration_sec * MAX_RATIO:
             diff = abs(duration - duration_sec)
-            playlist_info.append({"title": title,"id": pl_id,"duration": duration,"diff": diff,"url": f"https://www.youtube.com/playlist?list={pl_id}"})
+            playlist_info.append({
+                "title": title,
+                "id": pl_id,
+                "duration": duration,
+                "diff": diff,
+                "url": f"https://www.youtube.com/playlist?list={pl_id}"
+            })
     playlist_info.sort(key=lambda x: x["diff"])
 
     for i, p in enumerate(playlist_info, start=1):
         match_pct = (p['duration'] / duration_sec) * 100
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
+
     default_choice = random.randint(1, len(playlist_info))
-    choice = input_with_timeout("📝 Enter the number of the playlist you want to download: ", timeout=60, default=default_choice, cast_type=int, require_input=False, retries=0)
+    choice = input_with_timeout(
+        "📝 Enter the number of the playlist you want to download: ",
+        timeout=60, default=default_choice, cast_type=int,
+        require_input=False, retries=0
+    )
     stop_alerts.set()
     selected = playlist_info[choice-1]
+
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
-    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec, DOWNLOAD_FOLDER, cache, buffer_sec=30)
+
+    # Download entries
+    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec,
+                                              DOWNLOAD_FOLDER, cache, buffer_sec=30)
     download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+
+    # 🔑 Ensure audio length >= video length
+    total_audio = ensure_audio_matches_video(video_file, DOWNLOAD_FOLDER,
+                                             API_KEY, selected['url'], cache, buffer_sec=30)
+
+    # Merge and mix
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
     delete_if_exists(output_mp3)
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
     final_file = mix_audio_with_video(video_file, output_mp3)
+
     print(f'Created {final_file} with music')
     if DELETE_ORIGINALS:
         delete_if_exists(video_file)
     save_cache(cache)
-    return selected["title"], final_file
+
+    # 🔑 NEW: Upload the music version right away
+    choice = input_with_timeout(
+        "📝 Would you like to upload the music version? (y/n): ",
+        timeout=30, require_input=False, default="y"
+    )
+    stop_alerts.set()
+    if choice == "y":
+        upload_video(final_file, selected["title"], selected["url"], privacy_status="unlisted")
+
+    # ✅ Return title, final file, and URL
+    return selected["title"], final_file, selected["url"]
 
 
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
 # =========================
-httplib2.RETRIES = 1
-MAX_RETRIES = 10
-#RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError, httplib.NotConnected,
-#    httplib.IncompleteRead, httplib.ImproperConnectionState,
-#    httplib.CannotSendRequest, httplib.CannotSendHeader,
-#    httplib.ResponseNotReady, httplib.BadStatusLine,)
-RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError)
-RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
-YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
-YOUTUBE_API_SERVICE_NAME = "youtube"
-YOUTUBE_API_VERSION = "v3"
-VALID_PRIVACY_STATUSES = ("public","private","unlisted")
 
-def get_authenticated_service(args):
-    flow = flow_from_clientsecrets(CLIENT_SECRETS_FILE, scope=YOUTUBE_UPLOAD_SCOPE)
-    storage = Storage("%s-oauth2.json" % sys.argv[0])
-    credentials = storage.get()
-    if credentials is None or credentials.invalid:
-        credentials = run_flow(flow, storage, args)
-    return build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, http=credentials.authorize(httplib2.Http()))
+def get_authenticated_service():
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-def initialize_upload(youtube, options):
-    body = dict(snippet=dict(title=options.title, description=options.description, categoryId=options.category),
-                status=dict(privacyStatus=options.privacyStatus,selfDeclaredMadeForKids=False))
-    insert_request = youtube.videos().insert(part=",".join(body.keys()), body=body,
-        media_body=MediaFileUpload(options.file, chunksize=-1, resumable=True))
-    resumable_upload(insert_request)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+            creds = flow.run_local_server(port=8080)
+        with open(TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
+
+    # Create httplib2.Http and save its original request method
+    authed_http = httplib2.Http()
+    original_request = authed_http.request
+
+    # Define a wrapper that injects the bearer token
+    def auth_request(uri, method="GET", body=None, headers=None,
+                     redirections=5, connection_type=None):
+        if headers is None:
+            headers = {}
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+        headers["Authorization"] = f"Bearer {creds.token}"
+        return original_request(uri, method=method, body=body, headers=headers,
+                                redirections=redirections, connection_type=connection_type)
+
+    authed_http.request = auth_request
+
+    return build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, http=authed_http)
 
 def resumable_upload(insert_request):
-    response = None
-    error = None
-    retry = 0
+    response, error, retry = None, None, 0
+    start_time = time.time()
     while response is None:
         try:
-            print("Uploading file...")
             status, response = insert_request.next_chunk()
-            if response is not None:
-                if 'id' in response:
-                    print("Video id 'https://youtu.be/%s' was successfully uploaded." % response['id'])
-                else:
-                    exit("The upload failed with an unexpected response: %s" % response)
+            if status:
+                uploaded = int(status.progress() * 100)
+                elapsed = time.time() - start_time
+                print(f"Uploaded {uploaded}% - elapsed {elapsed:.1f}s")
+            if response and "id" in response:
+                total_time = time.time() - start_time
+                video_url = f"https://youtu.be/{response['id']}"
+                print(f"✅ Uploaded: {video_url}")
+                print(f"⏱️ Total time: {total_time:.1f}s")
+                try:
+                    pyperclip.copy(video_url)
+                except Exception:
+                    print("Clipboard copy not available.")
+                return video_url   # <-- return URL here
         except HttpError as e:
-            if e.resp.status in RETRIABLE_STATUS_CODES:
-                error = "A retriable HTTP error %d occurred:\n%s" % (e.resp.status, e.content)
+            if e.resp.status in [500,502,503,504]:
+                error = f"Retriable HTTP error {e.resp.status}"
             else:
                 raise
-        except RETRIABLE_EXCEPTIONS as e:
-            error = "A retriable error occurred: %s" % e
-
-        if error is not None:
-            print(error)
+        except Exception as e:
+            error = f"Retriable error: {e}"
+        if error:
             retry += 1
-            if retry > MAX_RETRIES:
-                exit("No longer attempting to retry.")
-
-            max_sleep = 2 ** retry
-            sleep_seconds = random.random() * max_sleep
-            print("Sleeping %f seconds and then retrying..." % sleep_seconds)
+            if retry > 10:
+                raise RuntimeError("Upload failed after max retries.")
+            sleep_seconds = random.random() * (2**retry)
+            print(f"{error}, sleeping {sleep_seconds:.1f}s...")
             time.sleep(sleep_seconds)
 
-def upload_video(video_file, playlist_title, privacy_status="unlisted"):
+def initialize_upload(youtube, options):
+    body = dict(
+        snippet=dict(
+            title=options.title,
+            description=options.description,
+            categoryId=options.category
+        ),
+        status=dict(
+            privacyStatus=options.privacyStatus,
+            selfDeclaredMadeForKids=False
+        )
+    )
+    insert_request = youtube.videos().insert(
+        part=",".join(body.keys()),
+        body=body,
+        media_body=MediaFileUpload(options.file, chunksize=-1, resumable=True)
+    )
+    resumable_upload(insert_request)
+
+def format_time(seconds):
+    """Convert seconds into H:MM:SS format."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    else:
+        return f"{m:02d}:{s:02d}"
+
+def get_latest_strava_activity():
+    url = "https://dylix.org/stravaWebhook?last"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+    # data is a list of dicts, so take the first element
+    if isinstance(data, list) and len(data) > 0:
+        return data[0].get("activityid")
+    return None
+
+def upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted"):
     from argparse import Namespace
+    
+    # Fetch latest Strava activity ID
+    strava_activity_id = get_latest_strava_activity()
+    strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
 
     args = Namespace(
         file=video_file,
         title=Path(video_file).stem,
-        description=f"Raw GoPro footage with music automatically added from '{playlist_title}' and then uploaded.",
-        category="22",  # People & Blogs
-        privacyStatus=privacy_status,
-        logging_level="ERROR",
-        auth_host_name="localhost",
-        noauth_local_webserver=False,
-        auth_host_port=[8080, 8090]
+        description=f"Raw GoPro footage with music automatically added from '{playlist_title}' and then uploaded.\n\n🎵 Listen to the full playlist here: {playlist_url}\n🚴 Strava activity: {strava_url}",
+        category="22",
+        privacyStatus=privacy_status
     )
-
-    youtube = get_authenticated_service(args)
-
+    youtube = get_authenticated_service()
     try:
-        initialize_upload(youtube, args)
+        video_url = initialize_upload(youtube, args)   # capture returned URL
+        if strava_activity_id and video_url:
+            webhook_url = f"https://dylix.org/stravaWebhook?youtube&activityid={strava_activity_id}&url={video_url}"
+            resp = requests.get(webhook_url)
+            print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
     except HttpError as e:
         print(f"🚨 HTTP error {e.resp.status} occurred:\n{e.content}")
+
+
 
 # =========================
 # Generates dummy GoPro-style videos with overlays and sets file modification times.
@@ -838,7 +957,7 @@ def get_file_sizes():
     return {
         f: f.stat().st_size
         for f in Path(VIDEO_FOLDER).glob("*.mp4")
-        if not f.name.endswith("-music.mp4")
+        if not f.name.lower().endswith("-music.mp4")
     }
 
 class SettlingHandler(FileSystemEventHandler):
@@ -896,21 +1015,19 @@ def process_video_file(video_file):
         if has_music_version(video_file):
             print(f"🎵 Skipping {video_file} — music version already exists.")
             return
-        playlist_title, final_video = run_add_music(video_file)
+        playlist_title, final_video, playlist_url = run_add_music(video_file)
         if final_video:
-            #choice = input("🛠️ Upload the video? This uses a lot of API daily credits. (y/n): ").strip().lower()
-            #choice = input_with_timeout("🛠️ Upload the video? This uses a lot of API daily credits. (y/n):\n📝 Enter your response within 30 seconds:", timeout=30)
             choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
             stop_alerts.set()
             if choice == "y":
-                upload_video(final_video, playlist_title)
+                upload_video(final_video, playlist_title, playlist_url)
 
 def process_all_new_files():
     print("🚀 Starting batch processing...")
     video_file = run_flipme()
     candidates = [
         f for f in Path(VIDEO_FOLDER).glob("*.mp4")
-        if not f.name.endswith("-music.mp4") and f.stat().st_size > 0
+        if not f.name.lower().endswith("-music.mp4") and f.stat().st_size > 0
     ]
     for f in candidates:
         print(f"🎬 Processing: {f.name}")
@@ -945,6 +1062,19 @@ def find_sidecars(root, mp4_name):
                 sidecars.append(os.path.join(root, f))
     return sidecars
 
+def eject_drive(drive_letter):
+    try:
+        # Use PowerShell COM object to eject the drive
+        cmd = (
+            "powershell",
+            f"(New-Object -comObject Shell.Application)"
+            f".NameSpace(17).ParseName('{drive_letter}:').InvokeVerb('Eject')"
+        )
+        subprocess.run(cmd, check=True, shell=True)
+        print(f"💽 Ejected {drive_letter}: successfully")
+    except Exception as e:
+        print(f"⚠️ Could not eject {drive_letter}: {e}")
+
 def copy_gopro_files(drive_letter):
     mount_point = f"{drive_letter}:\\"
     files_to_delete = []
@@ -977,51 +1107,10 @@ def copy_gopro_files(drive_letter):
                 print(f"   Removed {f}")
             except Exception as e:
                 print(f"⚠️ Could not delete {f}: {e}")
+        # After deletion, eject the drive
+        eject_drive(drive_letter)
     elif not DELETE_ORIGINALS and files_to_delete:
         print(f"ℹ️ {len(files_to_delete)} files verified, but not deleted (DELETE_ORIGINALS=False)")
-
-"""
-def copy_gopro_files(drive_letter):
-    mount_point = f"{drive_letter}:\\"
-    files_to_delete = []  # collect verified files for batch removal
-
-    for root, _, files in os.walk(mount_point):
-        for file in files:
-            name_upper = file.upper()
-            if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
-                src = os.path.join(root, file)
-                dst = os.path.join(VIDEO_FOLDER, file)
-                if not os.path.exists(dst):
-                    print(f"📥 Starting copy: {src} -> {dst}")
-                    try:
-                        copy_with_progress(src, dst)
-                        # ✅ Lightweight verification: compare file sizes
-                        if os.path.getsize(src) == os.path.getsize(dst):
-                            print(f"✅ Finished copying {file}, marking for deletion")
-                            # add MP4 and its sidecar files (.THM, .LRV) to delete list
-                            files_to_delete.append(src)
-                            base, _ = os.path.splitext(src)
-                            for ext in [".THM", ".LRV"]:
-                                sidecar = base + ext
-                                if os.path.exists(sidecar):
-                                    files_to_delete.append(sidecar)
-                        else:
-                            print(f"⚠️ Size mismatch for {file}, not deleting")
-                    except Exception as e:
-                        print(f"⚠️ Error copying {src}: {e}")
-
-    # --- Batch delete after all copies are done ---
-    if DELETE_ORIGINALS and files_to_delete:
-        print(f"🗑️ Deleting {len(files_to_delete)} files from USB...")
-        for f in files_to_delete:
-            try:
-                os.remove(f)
-                print(f"   Removed {f}")
-            except Exception as e:
-                print(f"⚠️ Could not delete {f}: {e}")
-    elif not DELETE_ORIGINALS and files_to_delete:
-        print(f"ℹ️ {len(files_to_delete)} files verified, but not deleted (DELETE_ORIGINALS=False)")
-"""
 
 # --- USB Listener Thread ---
 def usb_listener():
@@ -1169,13 +1258,26 @@ def show_popup():
     else:
         os.system('zenity --info --text="Please respond to the script!"')
 
+
+if __name__ == "!__main__":
+    # Point to your finished music file
+    video_file = r"D:\Users\dylix\source\repos\GoPro\dummy.mp4"
+    #video_file = r"G:\GoPro\Today\combined-2025-12-07-08-35-music.mp4"
+    # Give it a title and playlist info (you can reuse what run_add_music returned)
+    playlist_title = "Royalty Free Electronic Music"
+    playlist_url = "https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID"
+
+    # Upload directly
+    upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted")
+
+
 # =========================
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
-    #upload_video(r"D:\GoPro\today\combined-2025-09-20-07-03-music.mp4", "Dubstep  [No Copyright Sound] [ FREE USE MUSIC ]")
-    #print("exiting")
-    #exit()
+    # Optional quick test:
+    # upload_video(r"D:\GoPro\today\combined-2025-09-20-07-03-music.mp4",
+    #              "Dubstep  [No Copyright Sound] [ FREE USE MUSIC ]", "", privacy_status="unlisted")
     video_file = run_flipme()
 
     # --- Start Alert Threads ---
@@ -1183,10 +1285,10 @@ if __name__ == "__main__":
     if os.name == 'nt':
         threading.Thread(target=flash_window, daemon=True).start()
 
-        # Fallback: look for MP4s that don't end in -music.mp4
+        # First: look for raw MP4s (no '-music' suffix, case-insensitive)
         candidates = [
             f for f in Path(VIDEO_FOLDER).glob("*.mp4")
-            if not f.name.endswith("-music.mp4")
+            if not f.name.lower().endswith("-music.mp4")
         ]
 
         if candidates:
@@ -1194,32 +1296,82 @@ if __name__ == "__main__":
             for i, f in enumerate(candidates, 1):
                 print(f"{i}. {f.name}")
             try:
-                choice = input_with_timeout("📝 Select a file to add music to or press ENTER to skip..: ", timeout=30, require_input=False, default=1)
+                choice = input_with_timeout(
+                    "📝 Select a file to add music to or press ENTER to skip..: ",
+                    timeout=30, require_input=False, default=""
+                )
                 stop_alerts.set()
+
+                if not choice:  # ENTER pressed or timeout
+                    print("⏭️ Skipping add-music step, entering watch mode..")
+                    start_watcher_then_process()
+                    exit()
+
                 index = int(choice) - 1
                 selected_file = candidates[index]
                 print(f"🎬 You selected: {selected_file.name}")
-                playlist_title, final_video = run_add_music(selected_file)
+
+                playlist_title, final_video, playlist_url = run_add_music(str(selected_file))
                 if final_video:
-                    choice = input_with_timeout("📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
+                    choice = input_with_timeout(
+                        "📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ",
+                        timeout=30, require_input=False, default="y"
+                    )
                     stop_alerts.set()
                     if choice == "y":
-                        upload_video(final_video, playlist_title)
+                        upload_video(final_video, playlist_title, playlist_url, privacy_status="private")
             except (ValueError, IndexError):
                 print("❌ Invalid selection. Entering file watch mode..")
                 start_watcher_then_process()
                 exit()
+
         else:
-            print("📁 No eligible MP4 files found.")
-            choice = input_with_timeout("🛠️ Would you like to generate dummy GoPro clips? (y/n): ", timeout=10, default="n", cast_type=str).strip().lower()
-            stop_alerts.set()
-            if choice == "y":
-                generate_dummy_gopro_clips(VIDEO_FOLDER)
-                mp4_files = sorted([f for f in Path(VIDEO_FOLDER).glob("*") if f.suffix.lower() == ".mp4"])
-                print(f"✅ Generated {len(mp4_files)} dummy clips.")
-                video_file = run_flipme()
+            # NEW: If there are no raw files, offer to upload completed music versions
+            music_candidates = [
+                f for f in Path(VIDEO_FOLDER).glob("*.mp4")
+                if f.name.lower().endswith("-music.mp4")
+            ]
+
+            if music_candidates:
+                print("\n🎵 Completed music MP4 files available for upload:")
+                for i, f in enumerate(music_candidates, 1):
+                    print(f"{i}. {f.name}")
+                try:
+                    choice = input_with_timeout(
+                        "📝 Select a file to upload or press ENTER to skip..: ",
+                        timeout=30, require_input=False, default=""
+                    )
+                    stop_alerts.set()
+
+                    if not choice:  # ENTER pressed or timeout
+                        print("⏭️ Skipping upload, entering watch mode..")
+                        start_watcher_then_process()
+                        exit()
+
+                    index = int(choice) - 1
+                    selected_file = music_candidates[index]
+                    print(f"📤 You selected: {selected_file.name} for upload")
+
+                    # Use stem as a reasonable title; playlist_url unknown here
+                    upload_video(str(selected_file), Path(selected_file).stem, "", privacy_status="private")
+                except (ValueError, IndexError):
+                    print("❌ Invalid selection. Entering file watch mode..")
+                    start_watcher_then_process()
+                    exit()
             else:
-                print("🚪 Exiting without generating clips.")
+                print("📁 No eligible MP4 files found.")
+                choice = input_with_timeout(
+                    "🛠️ Would you like to generate dummy GoPro clips? (y/n): ",
+                    timeout=10, default="n", cast_type=str
+                ).strip().lower()
+                stop_alerts.set()
+                if choice == "y":
+                    generate_dummy_gopro_clips(VIDEO_FOLDER)
+                    mp4_files = sorted([f for f in Path(VIDEO_FOLDER).glob("*") if f.suffix.lower() == ".mp4"])
+                    print(f"✅ Generated {len(mp4_files)} dummy clips.")
+                    video_file = run_flipme()
+                else:
+                    print("🚪 Exiting without generating clips.")
     else:
         process_video_file(video_file)
 
