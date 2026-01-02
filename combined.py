@@ -74,10 +74,13 @@ DELETE_ORIGINALS = True
 MAX_RATIO = 2.0
 CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json")
 TOKEN_FILE = os.path.join(SCRIPT_FOLDER, "token.json")
-YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
 YOUTUBE_API_SERVICE_NAME = "youtube"
 YOUTUBE_API_VERSION = "v3"
 
+# GLOBAL VARS
+files_to_delete = []
+drive_letter_global = None
 last_event_time = time.time()
 
 with open(os.path.join(SCRIPT_FOLDER, "config.json")) as f:
@@ -162,7 +165,14 @@ def run_flipme():
         grouped.setdefault(key, []).append(file)
     processed_patterns = set()
     for group in grouped.values():
-        group.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        # Remove any files that disappeared between scan and sort
+        group = [f for f in group if f.exists()]
+        def safe_mtime(path):
+            try:
+                return path.stat().st_mtime
+            except FileNotFoundError:
+                return 0  # missing files sort last
+        group.sort(key=safe_mtime, reverse=True)
         for file in group[1:]:
             askpattern = file.name[-7:-4]
             if askpattern in processed_patterns:
@@ -455,7 +465,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
 
         filename = sanitize_filename(f"{title}.mp3")
         full_path = os.path.join(download_folder, filename)
-
+        ''''
         if os.path.exists(full_path):
             print(f"✅ Already downloaded: {full_path}")
         else:
@@ -477,7 +487,7 @@ def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, downlo
             except Exception as e:
                 print(f"❌ Failed to download {title}: {e}")
                 continue
-
+        '''
         cumulative_duration += duration
         selected_entries.append(url)
         print(f"✓ {title} — {duration:.1f}s → Total: {cumulative_duration:.1f}s")
@@ -500,6 +510,7 @@ def download_single_mp3(url, output_path, archive_path):
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
+        'final_ext': 'mp3',
         'quiet': False,
         'no_warnings': False,
         "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
@@ -530,6 +541,70 @@ def download_playlist_parallel(entry_urls, output_path, max_workers=4):
         print(r)
 
 # NEW
+
+def unified_download_playlist(entry_urls, output_path, max_workers=8):
+    """
+    Unified downloader:
+    - Parallel
+    - No duplicates
+    - Normalized filenames
+    - Always produces *.mp3 (never .mp3.mp3)
+    - Uses archive.txt to avoid re-downloading
+    """
+    os.makedirs(output_path, exist_ok=True)
+    archive_path = os.path.join(output_path, "archive.txt")
+
+    print(f"🚀 Unified parallel download with {max_workers} workers...")
+    results = []
+
+    def worker(url):
+        # yt-dlp sometimes includes ".mp3" in the title → strip it
+        def strip_mp3(name):
+            return name[:-4] if name.lower().endswith(".mp3") else name
+
+        # Template: always output *.mp3, never *.mp3.mp3
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': f'{output_path}/%(title)s.%(ext)s',
+            'download_archive': archive_path,
+            'overwriteskip': True,
+            'quiet': True,
+            'no_warnings': True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["default", "-tv_simply"],
+                    "player_js_version": "actual"
+                }
+            },
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'final_ext': 'mp3',
+            # Normalize filenames BEFORE writing
+            'sanitize_info': {
+                'title': strip_mp3
+            }
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return f"⬇️ {url}"
+        except Exception as e:
+            return f"❌ {url} — {e}"
+
+    # Parallel execution
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker, url) for url in entry_urls]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    print("🎧 Unified download complete:")
+    for r in results:
+        print(r)
+
 
 def fast_audio_duration(file):
     """Return duration in seconds using ffprobe metadata."""
@@ -578,7 +653,8 @@ def ensure_audio_matches_video(video_file, mp3_folder, api_key, playlist_url, ca
         extra_urls = get_limited_playlist_entries(api_key, playlist_url,
                                                   video_duration - total_audio,
                                                   mp3_folder, cache, buffer_sec=buffer_sec)
-        download_playlist_parallel(extra_urls, mp3_folder, max_workers=8)
+        #download_playlist_parallel(extra_urls, mp3_folder, max_workers=8)
+        unified_download_playlist(extra_urls, mp3_folder, max_workers=8)
         # Recalculate after top‑up
         mp3_files = [str(Path(mp3_folder) / f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
         total_audio = get_total_audio_duration(mp3_files)
@@ -704,7 +780,8 @@ def run_add_music(video_file):
     # Download entries
     entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec,
                                               DOWNLOAD_FOLDER, cache, buffer_sec=30)
-    download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+    #download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+    unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
 
     # 🔑 Ensure audio length >= video length
     total_audio = ensure_audio_matches_video(video_file, DOWNLOAD_FOLDER,
@@ -721,6 +798,7 @@ def run_add_music(video_file):
         delete_if_exists(video_file)
     save_cache(cache)
 
+    '''
     # 🔑 NEW: Upload the music version right away
     choice = input_with_timeout(
         "📝 Would you like to upload the music version? (y/n): ",
@@ -729,7 +807,7 @@ def run_add_music(video_file):
     stop_alerts.set()
     if choice == "y":
         upload_video(final_file, selected["title"], selected["url"], privacy_status="unlisted")
-
+    '''
     # ✅ Return title, final file, and URL
     return selected["title"], final_file, selected["url"]
 
@@ -740,32 +818,63 @@ def run_add_music(video_file):
 
 def get_authenticated_service():
     creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, YOUTUBE_UPLOAD_SCOPE)
 
+    # Load existing token
+    if os.path.exists(TOKEN_FILE):
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE, YOUTUBE_UPLOAD_SCOPE)
+        except Exception as e:
+            print(f"⚠️ token.json corrupted, deleting: {e}")
+            os.remove(TOKEN_FILE)
+            creds = None
+
+    # If missing or invalid, try refresh
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, YOUTUBE_UPLOAD_SCOPE)
+        if creds and creds.refresh_token:
+            try:
+                print("🔄 Refreshing YouTube OAuth token...")
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"❌ Refresh failed ({e}). Token revoked or expired.")
+                print("🧹 Deleting token.json and re-authenticating...")
+                if os.path.exists(TOKEN_FILE):
+                    os.remove(TOKEN_FILE)
+                creds = None
+
+        if not creds or not creds.valid:
+            print("🌐 Opening browser for YouTube OAuth login...")
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CLIENT_SECRETS_FILE, YOUTUBE_UPLOAD_SCOPE
+            )
             creds = flow.run_local_server(port=8080)
+
         with open(TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
-    # Create httplib2.Http and save its original request method
+    # ---- FORCE REFRESH BEFORE EVERY UPLOAD ----
+    if creds and creds.refresh_token:
+        try:
+            print("🔄 Forcing OAuth token refresh before upload...")
+            creds.refresh(Request())
+            with open(TOKEN_FILE, "w") as token:
+                token.write(creds.to_json())
+        except Exception as e:
+            print(f"❌ Forced refresh failed: {e}")
+            print("🧹 Deleting token.json and re-authenticating...")
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+            return get_authenticated_service()
+
+    # ---- FAST PATH BELOW ----
     authed_http = httplib2.Http()
     original_request = authed_http.request
 
-    # Define a wrapper that injects the bearer token
     def auth_request(uri, method="GET", body=None, headers=None,
                      redirections=5, connection_type=None):
         if headers is None:
             headers = {}
-        if not creds.valid and creds.refresh_token:
-            creds.refresh(Request())
         headers["Authorization"] = f"Bearer {creds.token}"
-        return original_request(uri, method=method, body=body, headers=headers,
-                                redirections=redirections, connection_type=connection_type)
+        return original_request(uri, method, body, headers, redirections, connection_type)
 
     authed_http.request = auth_request
 
@@ -784,6 +893,13 @@ def resumable_upload(insert_request):
             if response and "id" in response:
                 total_time = time.time() - start_time
                 video_url = f"https://youtu.be/{response['id']}"
+                # Fetch latest Strava activity ID
+                strava_activity_id = get_latest_strava_activity()
+                strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
+                if strava_activity_id and video_url:
+                    webhook_url = f"https://dylix.org/stravaWebhook?youtube&activityid={strava_activity_id}&url={video_url}"
+                    resp = requests.get(webhook_url)
+                    print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
                 print(f"✅ Uploaded: {video_url}")
                 print(f"⏱️ Total time: {total_time:.1f}s")
                 try:
@@ -846,11 +962,8 @@ def get_latest_strava_activity():
 
 def upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted"):
     from argparse import Namespace
-    
-    # Fetch latest Strava activity ID
     strava_activity_id = get_latest_strava_activity()
     strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
-
     args = Namespace(
         file=video_file,
         title=Path(video_file).stem,
@@ -860,11 +973,8 @@ def upload_video(video_file, playlist_title, playlist_url, privacy_status="unlis
     )
     youtube = get_authenticated_service()
     try:
-        video_url = initialize_upload(youtube, args)   # capture returned URL
-        if strava_activity_id and video_url:
-            webhook_url = f"https://dylix.org/stravaWebhook?youtube&activityid={strava_activity_id}&url={video_url}"
-            resp = requests.get(webhook_url)
-            print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
+        initialize_upload(youtube, args)   # capture returned URL
+        #manual_initialize_upload(youtube, args)
     except HttpError as e:
         print(f"🚨 HTTP error {e.resp.status} occurred:\n{e.content}")
 
@@ -1059,21 +1169,53 @@ def find_sidecars(root, mp4_name):
     return sidecars
 
 def eject_drive(drive_letter):
+    drive = f"{drive_letter}:"
+
+    # Quick check: drive already gone
+    if not os.path.exists(drive):
+        print(f"💽 Drive {drive} already ejected.")
+        return
+
+    # Primary PowerShell eject command
+    ps_cmd = (
+        f"(New-Object -ComObject Shell.Application)"
+        f".NameSpace(17).ParseName('{drive}').InvokeVerb('Eject')"
+    )
+
     try:
-        # Use PowerShell COM object to eject the drive
-        cmd = (
-            "powershell",
-            f"(New-Object -comObject Shell.Application)"
-            f".NameSpace(17).ParseName('{drive_letter}:').InvokeVerb('Eject')"
+        # Run PowerShell with a timeout to prevent hangs
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            check=True,
+            timeout=5
         )
-        subprocess.run(cmd, check=True, shell=True)
-        print(f"💽 Ejected {drive_letter}: successfully")
+        print(f"💽 Ejected {drive} successfully")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ Eject timed out for {drive}, trying fallback...")
     except Exception as e:
-        print(f"⚠️ Could not eject {drive_letter}: {e}")
+        print(f"⚠️ Primary eject failed: {e}, trying fallback...")
+
+    # Fallback: use Win32 API via PowerShell
+    fallback_cmd = (
+        f"$drive = Get-WmiObject Win32_Volume | "
+        f"Where-Object {{$_.DriveLetter -eq '{drive}'}}; "
+        f"if ($drive) {{ $drive.Dismount($false, $false) | Out-Null }}"
+    )
+
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", fallback_cmd],
+            timeout=5
+        )
+        print(f"💽 Fallback eject attempted for {drive}")
+    except Exception as e:
+        print(f"⚠️ Fallback eject failed: {e}")
 
 def copy_gopro_files(drive_letter):
+    global files_to_delete, drive_letter_global
+    drive_letter_global = drive_letter  # remember which drive we’re working with
     mount_point = f"{drive_letter}:\\"
-    files_to_delete = []
 
     for root, _, files in os.walk(mount_point):
         for file in files:
@@ -1088,25 +1230,34 @@ def copy_gopro_files(drive_letter):
                         if os.path.getsize(src) == os.path.getsize(dst):
                             print(f"✅ Finished copying {file}, marking for deletion")
                             files_to_delete.append(src)
-                            # find and queue matching THM/LRV by numeric ID
                             files_to_delete.extend(find_sidecars(root, file))
                         else:
                             print(f"⚠️ Size mismatch for {file}, not deleting")
                     except Exception as e:
                         print(f"⚠️ Error copying {src}: {e}")
 
-    if DELETE_ORIGINALS and files_to_delete:
-        print(f"🗑️ Deleting {len(files_to_delete)} files from USB...")
-        for f in set(files_to_delete):  # deduplicate
+def confirm_and_delete():
+    global files_to_delete, drive_letter_global
+    if not files_to_delete:
+        print("ℹ️ No files marked for deletion.")
+        return
+    if not drive_letter_global:
+        print("⚠️ No drive letter stored.")
+        return
+
+    choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=True, default="n").strip().lower()
+    if choice == "y":
+        for f in set(files_to_delete):
             try:
                 os.remove(f)
                 print(f"   Removed {f}")
             except Exception as e:
                 print(f"⚠️ Could not delete {f}: {e}")
-        # After deletion, eject the drive
-        eject_drive(drive_letter)
-    elif not DELETE_ORIGINALS and files_to_delete:
-        print(f"ℹ️ {len(files_to_delete)} files verified, but not deleted (DELETE_ORIGINALS=False)")
+        eject_drive(drive_letter_global)
+        files_to_delete.clear()
+        drive_letter_global = None
+    else:
+        print("ℹ️ Files left on the GoPro drive.")
 
 # --- USB Listener Thread ---
 def usb_listener():
@@ -1140,6 +1291,8 @@ def start_watcher_then_process():
             if last_event_time:  # only run if handler saw an event
                 wait_for_settle()          # settle logic
                 process_all_new_files()    # batch processing
+                if drive_letter_global:
+                    confirm_and_delete()
                 print("🔁 Returning to watch mode...\n")
                 last_event_time = None     # reset so we don't re-trigger
             else:
@@ -1197,55 +1350,65 @@ def safe_print(*args, **kwargs):
 # --- Timeout Logic ---
 
 def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
+    """
+    Reliable timeout input for Windows.
+    - No premature events
+    - No double reads
+    - No empty-string casting errors
+    """
+    def read_input(container):
+        try:
+            container.append(input())
+        except Exception:
+            container.append(None)
+
+    # Required input mode (no timeout)
     if require_input:
-        # Block until valid input is received
         while True:
             with print_lock:
-                sys.stdout.write(f"{prompt} (required): ")
+                sys.stdout.write(f"{prompt}: ")
                 sys.stdout.flush()
+
+            raw = input().strip()
             try:
-                user_input = input().strip()
-                return cast_type(user_input)
+                return cast_type(raw)
             except Exception as e:
                 safe_print(f"\n⚠️ Invalid input: {e}. Please try again.")
-    else:
-        # Use timeout + fallback logic
-        attempt = 0
-        while retries is None or attempt <= retries:
-            result = [None]
-            input_ready = threading.Event()
 
-            def get_input():
-                input_ready.set()
-                try:
-                    user_input = input()
-                    result[0] = cast_type(user_input)
-                except Exception as e:
-                    safe_print(f"\n⚠️ Input casting failed: {e}")
-                    result[0] = default
+    # Timeout mode
+    attempt = 0
+    while retries is None or attempt <= retries:
+        with print_lock:
+            sys.stdout.write(f"{prompt} (waiting {timeout}s, default: {default}): ")
+            sys.stdout.flush()
 
-            with print_lock:
-                sys.stdout.write(f"{prompt} (waiting {timeout}s{'...' if default is None else f', default: {default}'}): ")
-                sys.stdout.flush()
+        container = []
+        t = threading.Thread(target=read_input, args=(container,))
+        t.daemon = True
+        t.start()
+        t.join(timeout)
 
-            thread = threading.Thread(target=get_input)
-            thread.daemon = True
-            thread.start()
+        if t.is_alive():
+            safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
+            attempt += 1
+            if retries is not None and attempt > retries:
+                return default
+            continue
 
-            input_ready.wait(timeout=1.0)
-            thread.join(timeout)
+        # Thread finished — process input
+        if not container:
+            return default
 
-            if thread.is_alive():
-                safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
-                thread.join(0.1)
-                attempt += 1
-                if retries is not None and attempt > retries:
-                    return default
-                elif retries is None:
-                    return default
-            else:
-                return result[0] if result[0] is not None else default
+        raw = container[0].strip()
 
+        if raw == "":
+            return default
+
+        try:
+            return cast_type(raw)
+        except Exception as e:
+            safe_print(f"\n⚠️ Invalid input: {e}. Using default.")
+            return default
 
 # --- Optional Popup (cross-platform) ---
 def show_popup():
