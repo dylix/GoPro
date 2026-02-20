@@ -1244,7 +1244,7 @@ def confirm_and_delete():
     if not drive_letter_global:
         print("⚠️ No drive letter stored.")
         return
-
+    #print("DEBUG: files_to_delete =", files_to_delete)
     choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=True, default="n").strip().lower()
     if choice == "y":
         for f in set(files_to_delete):
@@ -1261,7 +1261,7 @@ def confirm_and_delete():
 
 # --- USB Listener Thread ---
 def usb_listener():
-    pythoncom.CoInitialize()  # COM init required in threads
+    pythoncom.CoInitialize()
     c = wmi.WMI()
     watcher = c.watch_for(
         notification_type="Creation",
@@ -1271,8 +1271,13 @@ def usb_listener():
         event = watcher()
         if event.EventType == 2:  # Device arrival
             drive_letter = event.DriveName.strip(":\\")
+            if not drive_letter:  # ignore bogus events
+                continue
+            if drive_letter == drive_letter_global:
+                continue  # ignore duplicate arrival events
             print(f"💽 USB inserted: {drive_letter}:\\")
             copy_gopro_files(drive_letter)
+
 
 # --- Your Watchdog Loop ---
 def start_watcher_then_process():
@@ -1349,66 +1354,89 @@ def safe_print(*args, **kwargs):
 
 # --- Timeout Logic ---
 
-def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
-    """
-    Reliable timeout input for Windows.
-    - No premature events
-    - No double reads
-    - No empty-string casting errors
-    """
-    def read_input(container):
-        try:
-            container.append(input())
-        except Exception:
-            container.append(None)
+import time
+import msvcrt
 
-    # Required input mode (no timeout)
-    if require_input:
+def input_with_timeout(
+    prompt,
+    timeout=30,
+    default=None,
+    cast_type=str,
+    require_input=False,
+    retries=0
+):
+    """
+    Bulletproof Windows-safe input with optional timeout.
+    - No background threads
+    - No stdin blocking issues
+    - No buffered keystrokes leaking into later prompts
+    - Works inside watchdog loops and long-running scripts
+    """
+
+    def read_line_blocking():
+        """Standard blocking input for require_input=True."""
         while True:
-            with print_lock:
-                sys.stdout.write(f"{prompt}: ")
-                sys.stdout.flush()
-
-            raw = input().strip()
+            raw = input(prompt).strip()
             try:
                 return cast_type(raw)
             except Exception as e:
-                safe_print(f"\n⚠️ Invalid input: {e}. Please try again.")
+                print(f"⚠️ Invalid input: {e}. Please try again.")
 
-    # Timeout mode
+    # -------------------------
+    # REQUIRED INPUT MODE
+    # -------------------------
+    if require_input:
+        return read_line_blocking()
+
+    # -------------------------
+    # TIMEOUT MODE
+    # -------------------------
     attempt = 0
     while retries is None or attempt <= retries:
-        with print_lock:
-            sys.stdout.write(f"{prompt} (waiting {timeout}s, default: {default}): ")
-            sys.stdout.flush()
 
-        container = []
-        t = threading.Thread(target=read_input, args=(container,))
-        t.daemon = True
-        t.start()
-        t.join(timeout)
+        print(f"{prompt} (waiting {timeout}s, default: {default}) ", end="", flush=True)
 
-        if t.is_alive():
-            safe_print(f"\n⏰ Timeout reached on attempt {attempt + 1}.")
-            attempt += 1
-            if retries is not None and attempt > retries:
-                return default
-            continue
+        buffer = []
+        start = time.time()
 
-        # Thread finished — process input
-        if not container:
-            return default
+        while True:
+            # If a key is waiting in the console buffer
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
 
-        raw = container[0].strip()
+                # Enter key ends input
+                if ch == "\r":
+                    print()  # newline
+                    raw = "".join(buffer).strip()
+                    if raw == "":
+                        return default
+                    try:
+                        return cast_type(raw)
+                    except Exception as e:
+                        print(f"⚠️ Invalid input: {e}. Using default.")
+                        return default
 
-        if raw == "":
-            return default
+                # Backspace support
+                elif ch == "\b":
+                    if buffer:
+                        buffer.pop()
+                        print("\b \b", end="", flush=True)
 
-        try:
-            return cast_type(raw)
-        except Exception as e:
-            safe_print(f"\n⚠️ Invalid input: {e}. Using default.")
-            return default
+                # Normal character
+                else:
+                    buffer.append(ch)
+                    print(ch, end="", flush=True)
+
+            # Timeout reached
+            if time.time() - start > timeout:
+                print()  # newline
+                attempt += 1
+                if retries is not None and attempt > retries:
+                    return default
+                print(f"⏰ Timeout reached on attempt {attempt}. Retrying...")
+                break
+
+            time.sleep(0.05)
 
 # --- Optional Popup (cross-platform) ---
 def show_popup():
