@@ -1357,22 +1357,10 @@ def safe_print(*args, **kwargs):
 import time
 import msvcrt
 
-def input_with_timeout(
-    prompt,
-    timeout=30,
-    default=None,
-    cast_type=str,
-    require_input=False,
-    retries=0
-):
-    """
-    Bulletproof Windows-safe input with optional timeout.
-    - No background threads
-    - No stdin blocking issues
-    - No buffered keystrokes leaking into later prompts
-    - Works inside watchdog loops and long-running scripts
-    """
-
+def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
+    # ----------------------------------------------------
+    # REQUIRED INPUT MODE (pure blocking, no timeout)
+    # ----------------------------------------------------
     def read_line_blocking():
         """Standard blocking input for require_input=True."""
         while True:
@@ -1382,29 +1370,29 @@ def input_with_timeout(
             except Exception as e:
                 print(f"⚠️ Invalid input: {e}. Please try again.")
 
-    # -------------------------
-    # REQUIRED INPUT MODE
-    # -------------------------
     if require_input:
         return read_line_blocking()
 
-    # -------------------------
+    # ----------------------------------------------------
     # TIMEOUT MODE
-    # -------------------------
+    # ----------------------------------------------------
     attempt = 0
+
     while retries is None or attempt <= retries:
 
-        print(f"{prompt} (waiting {timeout}s, default: {default}) ", end="", flush=True)
+        # Print prompt ONCE per attempt, AFTER buffer/timer is ready
+        sys.stdout.write(f"{prompt} (waiting {timeout}s, default: {default}) ")
+        sys.stdout.flush()
 
         buffer = []
         start = time.time()
 
         while True:
-            # If a key is waiting in the console buffer
+            # Check for keystrokes
             if msvcrt.kbhit():
                 ch = msvcrt.getwch()
 
-                # Enter key ends input
+                # ENTER ends input
                 if ch == "\r":
                     print()  # newline
                     raw = "".join(buffer).strip()
@@ -1416,18 +1404,20 @@ def input_with_timeout(
                         print(f"⚠️ Invalid input: {e}. Using default.")
                         return default
 
-                # Backspace support
+                # BACKSPACE
                 elif ch == "\b":
                     if buffer:
                         buffer.pop()
-                        print("\b \b", end="", flush=True)
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
 
-                # Normal character
+                # NORMAL CHAR
                 else:
                     buffer.append(ch)
-                    print(ch, end="", flush=True)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
 
-            # Timeout reached
+            # TIMEOUT
             if time.time() - start > timeout:
                 print()  # newline
                 attempt += 1
