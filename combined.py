@@ -1,7 +1,5 @@
 #!/usr/bin/python3
-
 #pip install --upgrade yt-dlp --pre
-
 
 import argparse
 import os
@@ -21,8 +19,10 @@ import wmi
 import pythoncom
 import socket
 import pyperclip
+import time
+import msvcrt
 
-#from argparse import Namespace
+from argparse import Namespace
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 #from apiclient.discovery import build
@@ -45,38 +45,102 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+# Windows-specific imports
+if os.name == 'nt':
+    import ctypes
+    import winsound
+
 # Optional: playsound or winsound depending on platform
 try:
     from playsound import playsound
 except ImportError:
     playsound = None
 
-# Windows-specific imports
-if os.name == 'nt':
-    import ctypes
-    import winsound
-
 # =========================
 # CONFIGURATION
 # =========================
-FFMPEG_PATH = r"C:\Program Files (x86)\ffmpeg\ffmpeg.exe"
-SCRIPT_FOLDER = r"D:\Users\dylix\source\repos\GoPro"
-MUSIC_FOLDER = r"G:\GoPro\Music"
-VIDEO_FOLDER = r"G:\GoPro\Today"
-WATCH_EXTENSIONS = {'.mp4'}
-SETTLE_TIME = 300  # seconds
-CHECK_INTERVAL = 10  # seconds
-CACHE_FILE = os.path.join(SCRIPT_FOLDER, "playlist_cache.json")
-SEARCH_TERM = "royalty free edm"
-CONFIRM = True
-FLIP_FILES = False
-DELETE_ORIGINALS = True
-MAX_RATIO = 2.0
-CLIENT_SECRETS_FILE = os.path.join(SCRIPT_FOLDER, "client_secrets.json")
-TOKEN_FILE = os.path.join(SCRIPT_FOLDER, "token.json")
-YOUTUBE_UPLOAD_SCOPE = ["https://www.googleapis.com/auth/youtube.upload"]
-YOUTUBE_API_SERVICE_NAME = "youtube"
-YOUTUBE_API_VERSION = "v3"
+CONFIG_FILE = "config.json"
+
+DEFAULT_CONFIG = {
+    "FFMPEG_PATH": r"C:\Program Files (x86)\ffmpeg\ffmpeg.exe",
+    "SCRIPT_FOLDER": r"D:\Users\dylix\source\repos\GoPro",
+    "MUSIC_FOLDER": r"D:\GoPro\Music",
+    "VIDEO_FOLDER": r"D:\GoPro\Today",
+    "WATCH_EXTENSIONS": [".mp4"],
+    "SETTLE_TIME": 300,
+    "CHECK_INTERVAL": 10,
+    "SEARCH_TERM": "royalty free edm",
+    "CONFIRM": True,
+    "FLIP_FILES": False,
+    "DELETE_ORIGINALS": True,
+    "MAX_RATIO": 2.0,
+    "CLIENT_SECRETS_FILE": "client_secrets.json",
+    "TOKEN_FILE": "token.json",
+    "YOUTUBE_UPLOAD_SCOPE": ["https://www.googleapis.com/auth/youtube.upload"],
+    "YOUTUBE_API_SERVICE_NAME": "youtube",
+    "YOUTUBE_API_VERSION": "v3"
+}
+
+def load_config():
+    # Create default config if missing
+    if not os.path.exists(CONFIG_FILE):
+        save_config(DEFAULT_CONFIG)
+        cfg = DEFAULT_CONFIG.copy()
+    else:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            # Corrupted file → rewrite defaults
+            save_config(DEFAULT_CONFIG)
+            cfg = DEFAULT_CONFIG.copy()
+
+    # Auto-repair missing keys
+    changed = False
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in cfg:
+            cfg[key] = default_value
+            changed = True
+
+    if changed:
+        save_config(cfg)
+
+    # Normalize paths
+    script_folder = cfg["SCRIPT_FOLDER"]
+
+    def resolve(path):
+        return path if os.path.isabs(path) else os.path.join(script_folder, path)
+
+    cfg["CLIENT_SECRETS_FILE"] = resolve(cfg["CLIENT_SECRETS_FILE"])
+    cfg["TOKEN_FILE"] = resolve(cfg["TOKEN_FILE"])
+    cfg["CACHE_FILE"] = os.path.join(script_folder, "playlist_cache.json")
+
+    return cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4)
+
+config = load_config()
+FFMPEG_PATH = config["FFMPEG_PATH"]
+SCRIPT_FOLDER = config["SCRIPT_FOLDER"]
+MUSIC_FOLDER = config["MUSIC_FOLDER"]
+VIDEO_FOLDER = config["VIDEO_FOLDER"]
+WATCH_EXTENSIONS = set(config["WATCH_EXTENSIONS"])
+SETTLE_TIME = config["SETTLE_TIME"]
+CHECK_INTERVAL = config["CHECK_INTERVAL"]
+SEARCH_TERM = config["SEARCH_TERM"]
+CONFIRM = config["CONFIRM"]
+FLIP_FILES = config["FLIP_FILES"]
+DELETE_ORIGINALS = config["DELETE_ORIGINALS"]
+MAX_RATIO = config["MAX_RATIO"]
+CLIENT_SECRETS_FILE = config["CLIENT_SECRETS_FILE"]
+TOKEN_FILE = config["TOKEN_FILE"]
+CACHE_FILE = config["CACHE_FILE"]
+YOUTUBE_UPLOAD_SCOPE = config["YOUTUBE_UPLOAD_SCOPE"]
+YOUTUBE_API_SERVICE_NAME = config["YOUTUBE_API_SERVICE_NAME"]
+YOUTUBE_API_VERSION = config["YOUTUBE_API_VERSION"]
+
 
 # GLOBAL VARS
 files_to_delete = []
@@ -293,8 +357,6 @@ def has_audio_stream(video_path):
     return bool(result.stdout.strip())
 
 def get_video_duration(video_file):
-    import subprocess
-
     def run_ffprobe(args):
         try:
             result = subprocess.run(
@@ -961,7 +1023,6 @@ def get_latest_strava_activity():
     return None
 
 def upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted"):
-    from argparse import Namespace
     strava_activity_id = get_latest_strava_activity()
     strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
     args = Namespace(
@@ -1076,14 +1137,24 @@ class SettlingHandler(FileSystemEventHandler):
                 print(f"📁 Event: {event.event_type.upper()} → {event.src_path}")
 
 def wait_for_settle():
-    print(f"⏳ Waiting for directory to settle...")
-    stable_start = None
+    print("⏳ Waiting for directory to settle...")
+
     previous_sizes = get_file_sizes()
 
+    # Capture the moment settle-check begins
+    settle_start_time = time.time()
+
+    # Pretend we've already been stable for the full window
+    stable_start = time.time() - SETTLE_TIME
+
+    POLL = CHECK_INTERVAL  # your 10s interval
+
     while True:
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(POLL)
 
         current_sizes = get_file_sizes()
+
+        # Detect size changes
         changed_files = [
             f for f in current_sizes
             if current_sizes[f] != previous_sizes.get(f)
@@ -1095,21 +1166,28 @@ def wait_for_settle():
                 old = previous_sizes.get(f, 0)
                 new = current_sizes[f]
                 print(f"   - {f.name}: {old} → {new}")
-            stable_start = None
             previous_sizes = current_sizes
+            stable_start = time.time()  # reset unified timer
             continue
 
-        if time.time() - last_event_time < SETTLE_TIME:
-            wait_time = int(time.time() - last_event_time)
-            print(f"🕒 Recent file event detected ({wait_time}s ago). Waiting...", end="\r")
-            stable_start = None
+        # Detect recent events, but ignore events that happened BEFORE this function started
+        since_event = time.time() - last_event_time
+        event_is_new = last_event_time >= settle_start_time
+
+        if event_is_new and since_event < SETTLE_TIME:
+            print(f"🕒 Recent file event detected ({int(since_event)}s ago). Waiting...", end="\r")
+            stable_start = time.time()  # reset unified timer
             continue
 
-        if stable_start is None:
-            stable_start = time.time()
+        # If we reach here: no size changes AND no new events
+        elapsed = time.time() - stable_start
+
+        # First time we enter stable state (only prints once)
+        if elapsed >= 0 and elapsed < POLL:
             print("📦 File sizes stable. Starting settle timer...              ")
 
-        elif time.time() - stable_start >= SETTLE_TIME:
+        # Unified 300-second window satisfied
+        if elapsed >= SETTLE_TIME:
             print("✅ Directory settled. No changes and stable sizes.           ")
             break
 
@@ -1353,9 +1431,6 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 # --- Timeout Logic ---
-
-import time
-import msvcrt
 
 def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
     # ----------------------------------------------------
