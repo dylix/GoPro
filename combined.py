@@ -1254,6 +1254,10 @@ def eject_drive(drive_letter):
         print(f"💽 Drive {drive} already ejected.")
         return
 
+    # Delay to allow Windows background services to release
+    handles print("🕒 Waiting 10 seconds before eject...")
+    time.sleep(10)
+
     # Primary PowerShell eject command
     ps_cmd = (
         f"(New-Object -ComObject Shell.Application)"
