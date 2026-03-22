@@ -21,6 +21,13 @@ import socket
 import pyperclip
 import time
 import msvcrt
+import ctypes
+
+# Win32 constants
+GENERIC_READ  = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_NONE = 0
+OPEN_EXISTING = 3
 
 from argparse import Namespace
 from tqdm import tqdm
@@ -44,6 +51,8 @@ from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+
+HANDLE_EXE = os.path.join(os.path.dirname(__file__), "handle64.exe")
 
 # Windows-specific imports
 if os.name == 'nt':
@@ -201,130 +210,122 @@ def is_valid_mp4(filepath):
         print(f"Error validating {filepath}: {e}")
         return False
 
-
 def run_flipme():
     script_root = Path(VIDEO_FOLDER)
-    all_files = list(script_root.glob("*.mp4"))
-    mp4_files = []
 
-    for f in all_files:
-        if is_valid_mp4(f):
-            mp4_files.append(f)
-        else:
-            print(f"🗑️ Deleting invalid file: {f.name}")
-            try:
-                f.unlink()
-            except Exception as e:
-                print(f"⚠️ Failed to delete {f.name}: {e}")
+    all_files = list(script_root.glob("*.mp4"))
+    mp4_files = [
+        f for f in all_files
+        if is_valid_mp4(f)
+        and "combined-" not in f.name.lower()
+        and "-music" not in f.name.lower()
+        and "flipped" not in f.name.lower()
+    ]
 
     print(f"✅ Valid MP4 files: {[f.name for f in mp4_files]}")
     if not mp4_files:
-        #print("No MP4 files found.")
-        return None
+        return None, None
 
-    # Group files
-    grouped = {}
+    groups = {}
     for file in mp4_files:
         key = extract_timestamp_key(file.name)
-        grouped.setdefault(key, []).append(file)
-    processed_patterns = set()
-    for group in grouped.values():
-        # Remove any files that disappeared between scan and sort
-        group = [f for f in group if f.exists()]
-        def safe_mtime(path):
-            try:
-                return path.stat().st_mtime
-            except FileNotFoundError:
-                return 0  # missing files sort last
-        group.sort(key=safe_mtime, reverse=True)
-        for file in group[1:]:
-            askpattern = file.name[-7:-4]
-            if askpattern in processed_patterns:
-                print(f"Skipping pattern {askpattern}, already processed.")
-                continue
-            processed_patterns.add(askpattern)
-            combined_files = []
-            orig_name = ""
-            filelist_path = script_root / "filelist.txt"
-            with open(filelist_path, "w", encoding="utf-8") as f:
-                for candidate in script_root.glob(f"*{askpattern}*.MP4"):
-                    if "flipped" in candidate.name or "combined-" in candidate.name:
-                        continue
-                    if askpattern in candidate.name:
-                        if FLIP_FILES:
-                            newname = candidate.stem + "-flipped.MP4"
-                            if not orig_name:
-                                orig_name = newname
-                            combined_files.append(newname)
-                            f.write(f"file '{script_root / newname}'\n")
-                            subprocess.run([
-                                FFMPEG_PATH, "-i", str(candidate),
-                                "-metadata:s:v", "rotate=180",
-                                "-codec", "copy", str(script_root / newname)
-                            ])
-                            if DELETE_ORIGINALS:
-                                delete_if_exists(script_root / candidate)
-                        else:
-                            if not orig_name:
-                                orig_name = candidate.name
-                            combined_files.append(candidate.name)
-                            f.write(f"file '{candidate}'\n")
+        groups.setdefault(key, []).append(file)
 
-            if combined_files:
-                #output_name = f"combined-{orig_name}"
-                output_path = get_unique_filename(script_root / f"combined-{orig_name}")
-                subprocess.run([
-                    FFMPEG_PATH, "-f", "concat", "-safe", "0",
-                    "-i", str(filelist_path), "-c", "copy", str(output_path)
-                ])
-                if DELETE_ORIGINALS:
-                    for name in combined_files:
-                        delete_if_exists(script_root / name)
-            delete_if_exists(filelist_path)
+    for key in groups:
+        groups[key].sort(key=lambda f: get_time_from_name(f.name))
 
-    # Second pass: group by date
-    date_groups = {}
-    input_files = [f for f in script_root.glob("*.MP4")]
-    for file in input_files:
-        if "-music" in file.name:
-            print(f"⏭️ Skipping {file.name} (contains '-music')")
-            continue
-        date = get_date_from_name(file.name)
-        date_groups.setdefault(date, []).append(file)
+    sorted_group_keys = sorted(
+        groups.keys(),
+        key=lambda k: get_time_from_name(groups[k][0].name)
+    )
 
-    final_output = None
-    for date, files in date_groups.items():
-        if len(files) < 2:
-            continue
-        files.sort(key=lambda f: get_time_from_name(f.name))
-        earliest_time = sorted(get_time_from_name(f.name) for f in files)[0]
-        output_file = script_root / f"combined-{date}-{earliest_time}.mp4"
+    chapter_durations = []
+    for key in sorted_group_keys:
+        total = 0
+        for f in groups[key]:
+            total += get_duration_seconds(f)
+        chapter_durations.append((key, total))
 
-        if output_file.exists():
-            output_file = get_unique_filename(output_file)
-
-        list_file = script_root / f"{date}-files.txt"
-        with open(list_file, "w", encoding="utf-8") as f:
-            for file in files:
+    list_file = script_root / "all-files.txt"
+    with open(list_file, "w", encoding="utf-8") as f:
+        for key in sorted_group_keys:
+            for file in groups[key]:
                 f.write(f"file '{file}'\n")
 
-        subprocess.run([
-            FFMPEG_PATH, "-f", "concat", "-safe", "0",
-            "-i", str(list_file), "-c", "copy", str(output_file)
-        ])
+    first_key = sorted_group_keys[0]
+    date = "-".join(first_key.split("-")[0:3])
+    earliest_time = get_time_from_name(groups[first_key][0].name)
 
-        if output_file.exists() and output_file.stat().st_size > 0:
-            print(f"Output file {output_file.name} created successfully.")
-            final_output = str(output_file)
-            if DELETE_ORIGINALS:
-                for file in files:
-                    delete_if_exists(script_root / file.name)
-        delete_if_exists(list_file)
-    return final_output
+    output_file = script_root / f"combined-{date}-{earliest_time}.mp4"
+    if output_file.exists():
+        output_file = get_unique_filename(output_file)
+
+    print(f"🎬 Merging into: {output_file.name}")
+    subprocess.run([
+        FFMPEG_PATH, "-f", "concat", "-safe", "0",
+        "-i", str(list_file), "-c", "copy", str(output_file)
+    ])
+
+    delete_if_exists(list_file)
+
+    if output_file.exists() and output_file.stat().st_size > 0:
+        chapter_text = build_youtube_chapters(chapter_durations)
+
+        chapter_file = Path(str(output_file) + ".chapters.txt")
+        with open(chapter_file, "w", encoding="utf-8") as cf:
+            cf.write(chapter_text)
+
+        print(f"📄 Saved chapter text to: {chapter_file.name}")
+
+        print("🧹 Cleaning up original GoPro files...")
+        for key in sorted_group_keys:
+            for file in groups[key]:
+                delete_if_exists(file)
+
+        print(f"🎉 Final merged file ready: {output_file.name}")
+        print("🧼 All original chunks deleted (production mode).")
+
+        return str(output_file), chapter_text
+
+    print("❌ Merge failed or output file missing.")
+    return None, None
+
+def format_ts(sec):
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+def build_youtube_chapters(chapter_durations):
+    lines = []
+    cumulative = 0
+    for name, dur in chapter_durations:
+        clean_name = Path(name).stem.replace("combined-", "")
+        lines.append(f"{format_ts(cumulative)} {clean_name}")
+        cumulative += dur
+    return "\n".join(lines)
+
+def get_duration_seconds(path):
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path)
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return int(float(result.stdout.strip()))
+    except:
+        return 0
 
 # =========================
 # STEP 2: ADD MUSIC FUNCTIONS
 # =========================
+def load_chapter_text_for(video_path: str) -> str:
+    cf = Path(video_path + ".chapters.txt")
+    if cf.exists():
+        return cf.read_text(encoding="utf-8")
+    print(f"⚠️ No chapter file found for {video_path}")
+    return ""
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
@@ -798,8 +799,8 @@ def sanitize_filename(filename, replacement=""):
 
 #'''
 def run_add_music(video_file):
-    if not video_file: 
-        return None, None
+    if not video_file:
+        return None, None, None
 
     duration_sec = get_video_duration(video_file)
     print(f"Duration of combined video: {duration_sec/60:.1f} mins")
@@ -812,7 +813,7 @@ def run_add_music(video_file):
         pl_id = pl["id"]["playlistId"]
         title = pl["snippet"]["title"]
         duration = get_playlist_duration(API_KEY, pl_id, cache)
-        if duration_sec <= duration:  # and duration <= duration_sec * MAX_RATIO:
+        if duration_sec <= duration:
             diff = abs(duration - duration_sec)
             playlist_info.append({
                 "title": title,
@@ -828,28 +829,29 @@ def run_add_music(video_file):
         print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
 
     default_choice = random.randint(1, len(playlist_info))
+    start_alerts()
     choice = input_with_timeout(
         "📝 Enter the number of the playlist you want to download: ",
         timeout=60, default=default_choice, cast_type=int,
         require_input=False, retries=0
     )
-    stop_alerts.set()
+    stop_all_alerts()
     selected = playlist_info[choice-1]
 
     playlist_clean_name = sanitize_filename(selected["title"])
     DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
 
-    # Download entries
-    entry_urls = get_limited_playlist_entries(API_KEY, selected['url'], duration_sec,
-                                              DOWNLOAD_FOLDER, cache, buffer_sec=30)
-    #download_playlist_parallel(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+    entry_urls = get_limited_playlist_entries(
+        API_KEY, selected['url'], duration_sec,
+        DOWNLOAD_FOLDER, cache, buffer_sec=30
+    )
     unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
 
-    # 🔑 Ensure audio length >= video length
-    total_audio = ensure_audio_matches_video(video_file, DOWNLOAD_FOLDER,
-                                             API_KEY, selected['url'], cache, buffer_sec=30)
+    total_audio = ensure_audio_matches_video(
+        video_file, DOWNLOAD_FOLDER,
+        API_KEY, selected['url'], cache, buffer_sec=30
+    )
 
-    # Merge and mix
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
     delete_if_exists(output_mp3)
     merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
@@ -860,23 +862,29 @@ def run_add_music(video_file):
         delete_if_exists(video_file)
     save_cache(cache)
 
-    '''
-    # 🔑 NEW: Upload the music version right away
-    choice = input_with_timeout(
-        "📝 Would you like to upload the music version? (y/n): ",
-        timeout=30, require_input=False, default="y"
-    )
-    stop_alerts.set()
-    if choice == "y":
-        upload_video(final_file, selected["title"], selected["url"], privacy_status="unlisted")
-    '''
-    # ✅ Return title, final file, and URL
     return selected["title"], final_file, selected["url"]
 
 
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
 # =========================
+def print_progress(progress, start_time):
+    bar_len = 30
+    filled = int(bar_len * progress)
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    elapsed = time.time() - start_time
+    if progress > 0:
+        eta = elapsed / progress - elapsed
+    else:
+        eta = 0
+
+    sys.stdout.write(
+        f"\rUploading: [{bar}] {int(progress*100)}%  "
+        f"Elapsed: {format_time(elapsed)}  "
+        f"ETA: {format_time(eta)}"
+    )
+    sys.stdout.flush()
 
 def get_authenticated_service():
     creds = None
@@ -918,6 +926,7 @@ def get_authenticated_service():
         try:
             print("🔄 Forcing OAuth token refresh before upload...")
             creds.refresh(Request())
+            print("✅ OAuth token refreshed.")
             with open(TOKEN_FILE, "w") as token:
                 token.write(creds.to_json())
         except Exception as e:
@@ -949,9 +958,7 @@ def resumable_upload(insert_request):
         try:
             status, response = insert_request.next_chunk()
             if status:
-                uploaded = int(status.progress() * 100)
-                elapsed = time.time() - start_time
-                print(f"Uploaded {uploaded}% - elapsed {elapsed:.1f}s")
+                print_progress(status.progress(), start_time)
             if response and "id" in response:
                 total_time = time.time() - start_time
                 video_url = f"https://youtu.be/{response['id']}"
@@ -1013,33 +1020,37 @@ def format_time(seconds):
         return f"{m:02d}:{s:02d}"
 
 def get_latest_strava_activity():
-    url = "https://dylix.org/stravaWebhook?last"
+    url = "https://dylix.org/stravaWebhook?lastride"
     resp = requests.get(url)
     resp.raise_for_status()
     data = resp.json()
-    # data is a list of dicts, so take the first element
-    if isinstance(data, list) and len(data) > 0:
-        return data[0].get("activityid")
+
+    # data is a single dict, so just return the id field
+    if isinstance(data, dict):
+        return data.get("id")
+
     return None
 
-def upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted"):
+def upload_video(video_file, playlist_title, playlist_url, chapter_text, privacy_status="unlisted"):
     strava_activity_id = get_latest_strava_activity()
     strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
     args = Namespace(
         file=video_file,
         title=Path(video_file).stem,
-        description=f"Raw GoPro footage with music automatically added from '{playlist_title}' and then uploaded.\n\n🎵 Listen to the full playlist here: {playlist_url}\n🚴 Strava activity: {strava_url}",
+        description=(
+            f"=== Chapters ===\n{chapter_text}\n\n"
+            f"Raw GoPro footage with music automatically added from '{playlist_title}' and then uploaded.\n"
+            f"🎵 Listen to the full playlist here: {playlist_url}\n"
+            f"🚴 Strava activity: {strava_url}"
+        ),
         category="22",
         privacyStatus=privacy_status
     )
     youtube = get_authenticated_service()
     try:
-        initialize_upload(youtube, args)   # capture returned URL
-        #manual_initialize_upload(youtube, args)
+        initialize_upload(youtube, args)
     except HttpError as e:
         print(f"🚨 HTTP error {e.resp.status} occurred:\n{e.content}")
-
-
 
 # =========================
 # Generates dummy GoPro-style videos with overlays and sets file modification times.
@@ -1191,7 +1202,7 @@ def wait_for_settle():
             print("✅ Directory settled. No changes and stable sizes.           ")
             break
 
-def process_video_file(video_file):
+def process_video_file(video_file, chapter_durations):
     if not video_file:
         #print("No combined video created.")
         return
@@ -1201,21 +1212,27 @@ def process_video_file(video_file):
             return
         playlist_title, final_video, playlist_url = run_add_music(video_file)
         if final_video:
+            start_alerts()
             choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
-            stop_alerts.set()
+            stop_all_alerts()
             if choice == "y":
-                upload_video(final_video, playlist_title, playlist_url)
+                upload_video(final_video, playlist_title, playlist_url, chapter_durations)
 
 def process_all_new_files():
     print("🚀 Starting batch processing...")
-    video_file = run_flipme()
+    #video_file = run_flipme()
+    result = run_flipme()
+    if not result:
+        return
+
+    video_file, chapter_durations = result
     candidates = [
         f for f in Path(VIDEO_FOLDER).glob("*.mp4")
         if not f.name.lower().endswith("-music.mp4") and f.stat().st_size > 0
     ]
     for f in candidates:
         print(f"🎬 Processing: {f.name}")
-        process_video_file(f)
+        process_video_file(f, chapter_durations)
 
 # --- Helper: Copy GoPro files with progress ---
 def copy_with_progress(src, dst, buffer_size=1024*1024):
@@ -1246,6 +1263,76 @@ def find_sidecars(root, mp4_name):
                 sidecars.append(os.path.join(root, f))
     return sidecars
 
+def get_blocking_pids(drive_letter: str):
+    """Return list of PIDs holding handles on the drive."""
+    try:
+        result = subprocess.run(
+            [HANDLE_EXE, drive_letter],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+    except Exception:
+        return []
+
+    pids = set()
+    for line in result.stdout.splitlines():
+        if drive_letter in line:
+            m = re.search(r"pid:\s*(\d+)", line)
+            if m:
+                pids.add(int(m.group(1)))
+    return list(pids)
+
+
+def wait_for_drive_release(drive_letter: str, timeout_seconds: int = 60):
+    """Wait up to timeout_seconds for the drive to become free."""
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        pids = get_blocking_pids(drive_letter)
+        if not pids:
+            return True
+        time.sleep(1)
+    return False
+
+
+def kill_blockers(pids):
+    """Force-kill blocking processes."""
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+        except Exception:
+            pass
+
+def can_lock_volume(drive_letter: str) -> bool:
+    """Attempt to take an exclusive lock on the volume."""
+    path = f"\\\\.\\{drive_letter}:"
+    handle = ctypes.windll.kernel32.CreateFileW(
+        path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_NONE,
+        None,
+        OPEN_EXISTING,
+        0,
+        None
+    )
+
+    # INVALID_HANDLE_VALUE = -1 or 0xFFFFFFFF
+    if handle in (0, -1, 0xFFFFFFFF):
+        return False
+
+    ctypes.windll.kernel32.CloseHandle(handle)
+    return True
+
+
+def wait_for_kernel_release(drive_letter: str, timeout_seconds: int = 60):
+    """Wait until Windows kernel releases the volume."""
+    start = time.time()
+    while time.time() - start < timeout_seconds:
+        if can_lock_volume(drive_letter):
+            return True
+        time.sleep(1)
+    return False
+
 def eject_drive(drive_letter):
     drive = f"{drive_letter}:"
 
@@ -1254,18 +1341,24 @@ def eject_drive(drive_letter):
         print(f"💽 Drive {drive} already ejected.")
         return
 
-    # Delay to allow Windows background services to release handles
+    # Initial settle delay
     print("🕒 Waiting 10 seconds before eject...")
     time.sleep(10)
 
-    # Primary PowerShell eject command
+    # Kernel-level wait
+    print(f"🔍 Checking for kernel locks on {drive}...")
+    if wait_for_kernel_release(drive_letter, timeout_seconds=60):
+        print("✅ Drive is free at kernel level, proceeding with eject...")
+    else:
+        print("⚠️ Kernel still holding the drive after 60s. Proceeding anyway (Windows will likely still reject eject).")
+
+    # Primary PowerShell eject
     ps_cmd = (
         f"(New-Object -ComObject Shell.Application)"
         f".NameSpace(17).ParseName('{drive}').InvokeVerb('Eject')"
     )
 
     try:
-        # Run PowerShell with a timeout to prevent hangs
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             check=True,
@@ -1278,7 +1371,7 @@ def eject_drive(drive_letter):
     except Exception as e:
         print(f"⚠️ Primary eject failed: {e}, trying fallback...")
 
-    # Fallback: use Win32 API via PowerShell
+    # Fallback eject
     fallback_cmd = (
         f"$drive = Get-WmiObject Win32_Volume | "
         f"Where-Object {{$_.DriveLetter -eq '{drive}'}}; "
@@ -1327,6 +1420,7 @@ def confirm_and_delete():
         print("⚠️ No drive letter stored.")
         return
     #print("DEBUG: files_to_delete =", files_to_delete)
+    start_alerts()
     choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=True, default="n").strip().lower()
     if choice == "y":
         for f in set(files_to_delete):
@@ -1340,6 +1434,7 @@ def confirm_and_delete():
         drive_letter_global = None
     else:
         print("ℹ️ Files left on the GoPro drive.")
+    stop_all_alerts()
 
 # --- USB Listener Thread ---
 def usb_listener():
@@ -1524,112 +1619,116 @@ if __name__ == "!__main__":
     playlist_url = "https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID"
 
     # Upload directly
-    upload_video(video_file, playlist_title, playlist_url, privacy_status="unlisted")
+    upload_video(video_file, playlist_title, playlist_url, chapter_durations, privacy_status="unlisted")
 
+
+def start_alerts():
+    stop_alerts.clear()
+    threading.Thread(target=sound_loop, daemon=True).start()
+    if os.name == 'nt':
+        threading.Thread(target=flash_window, daemon=True).start()
+
+def stop_all_alerts():
+    stop_alerts.set()
 
 # =========================
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
-    # Optional quick test:
-    # upload_video(r"D:\GoPro\today\combined-2025-09-20-07-03-music.mp4",
-    #              "Dubstep  [No Copyright Sound] [ FREE USE MUSIC ]", "", privacy_status="unlisted")
-    video_file = run_flipme()
+    script_root = Path(VIDEO_FOLDER)
 
-    # --- Start Alert Threads ---
-    threading.Thread(target=sound_loop, daemon=True).start()
-    if os.name == 'nt':
-        threading.Thread(target=flash_window, daemon=True).start()
+    # Detect state
+    raw_chunks = [
+        f for f in script_root.glob("*.mp4")
+        if is_valid_mp4(f)
+        and "combined-" not in f.name.lower()
+        and "-music" not in f.name.lower()
+        and "flipped" not in f.name.lower()
+    ]
+    music_candidates = sorted(
+        [f for f in script_root.glob("*.mp4") if f.name.lower().endswith("-music.mp4")]
+    )
+    merged_candidates = sorted(
+        [f for f in script_root.glob("combined-*.mp4")
+         if not f.name.lower().endswith("-music.mp4")]
+    )
 
-        # First: look for raw MP4s (no '-music' suffix, case-insensitive)
-        candidates = [
-            f for f in Path(VIDEO_FOLDER).glob("*.mp4")
-            if not f.name.lower().endswith("-music.mp4")
-        ]
+    video_file = None
+    chapter_text = ""
 
-        if candidates:
-            print("\n🎵 Available MP4 files:")
-            for i, f in enumerate(candidates, 1):
-                print(f"{i}. {f.name}")
-            try:
-                choice = input_with_timeout(
-                    "📝 Select a file to add music to or press ENTER to skip..: ",
-                    timeout=30, require_input=False, default=""
-                )
-                stop_alerts.set()
-
-                if not choice:  # ENTER pressed or timeout
-                    print("⏭️ Skipping add-music step, entering watch mode..")
-                    start_watcher_then_process()
-                    exit()
-
-                index = int(choice) - 1
-                selected_file = candidates[index]
-                print(f"🎬 You selected: {selected_file.name}")
-
-                playlist_title, final_video, playlist_url = run_add_music(str(selected_file))
-                if final_video:
-                    choice = input_with_timeout(
-                        "📝 Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ",
-                        timeout=30, require_input=False, default="y"
-                    )
-                    stop_alerts.set()
-                    if choice == "y":
-                        upload_video(final_video, playlist_title, playlist_url, privacy_status="private")
-            except (ValueError, IndexError):
-                print("❌ Invalid selection. Entering file watch mode..")
-                start_watcher_then_process()
-                exit()
-
-        else:
-            # NEW: If there are no raw files, offer to upload completed music versions
-            music_candidates = [
-                f for f in Path(VIDEO_FOLDER).glob("*.mp4")
-                if f.name.lower().endswith("-music.mp4")
-            ]
-
-            if music_candidates:
-                print("\n🎵 Completed music MP4 files available for upload:")
-                for i, f in enumerate(music_candidates, 1):
-                    print(f"{i}. {f.name}")
-                try:
-                    choice = input_with_timeout(
-                        "📝 Select a file to upload or press ENTER to skip..: ",
-                        timeout=30, require_input=False, default=""
-                    )
-                    stop_alerts.set()
-
-                    if not choice:  # ENTER pressed or timeout
-                        print("⏭️ Skipping upload, entering watch mode..")
-                        start_watcher_then_process()
-                        exit()
-
-                    index = int(choice) - 1
-                    selected_file = music_candidates[index]
-                    print(f"📤 You selected: {selected_file.name} for upload")
-
-                    # Use stem as a reasonable title; playlist_url unknown here
-                    upload_video(str(selected_file), Path(selected_file).stem, "", privacy_status="private")
-                except (ValueError, IndexError):
-                    print("❌ Invalid selection. Entering file watch mode..")
-                    start_watcher_then_process()
-                    exit()
-            else:
-                print("📁 No eligible MP4 files found.")
-                choice = input_with_timeout(
-                    "🛠️ Would you like to generate dummy GoPro clips? (y/n): ",
-                    timeout=10, default="n", cast_type=str
-                ).strip().lower()
-                stop_alerts.set()
-                if choice == "y":
-                    generate_dummy_gopro_clips(VIDEO_FOLDER)
-                    mp4_files = sorted([f for f in Path(VIDEO_FOLDER).glob("*") if f.suffix.lower() == ".mp4"])
-                    print(f"✅ Generated {len(mp4_files)} dummy clips.")
-                    video_file = run_flipme()
-                else:
-                    print("🚪 Exiting without generating clips.")
+    # 1) If raw chunks exist → merge
+    if raw_chunks:
+        video_file, chapter_text = run_flipme()
+        if not video_file:
+            print("❌ Merge failed. Exiting.")
+            exit()
+    # 2) Else if merged file exists → use it
+    elif merged_candidates:
+        video_file = str(merged_candidates[0])
+        chapter_text = load_chapter_text_for(video_file)
+    # 3) Else if only music file exists → upload only
+    elif music_candidates:
+        final_video = str(music_candidates[0])
+        chapter_text = load_chapter_text_for(final_video.replace("-music.mp4", ".mp4"))
+        start_alerts()
+        choice = input_with_timeout(
+            f"📤 Upload existing music video '{Path(final_video).name}'? (y/n): ",
+            timeout=30, require_input=False, default="n"
+        )
+        stop_all_alerts()
+        if choice.lower() == "y":
+            upload_video(final_video, Path(final_video).stem, "", chapter_text, privacy_status="unlisted")
+        start_watcher_then_process()
+        exit()
     else:
-        process_video_file(video_file)
+        print("📁 No eligible MP4 files found.")
 
-    # 🔁 Start watching for new files after initial run
+        start_alerts()
+        choice = input_with_timeout(
+            "🛠️ Generate dummy GoPro clips for testing? (y/n): ",
+            timeout=15,
+            require_input=False,
+            default="n"
+        )
+        stop_all_alerts()
+
+        if choice.lower() == "y":
+            generate_dummy_gopro_clips(VIDEO_FOLDER)
+            print("✅ Dummy clips generated. Starting merge...")
+            video_file, chapter_text = run_flipme()
+        else:
+            print("⏳ Entering watch mode...")
+            start_watcher_then_process()
+            exit()
+
+
+    print(f"🎬 Final merged file: {video_file}")
+    print(f"📄 Chapter file: {video_file}.chapters.txt")
+
+    # Add music if no music version yet
+    existing_music = [
+        f for f in script_root.glob("*.mp4")
+        if f.name.lower().endswith("-music.mp4")
+    ]
+    if existing_music:
+        final_video = str(existing_music[0])
+        print(f"🎵 Using existing music video: {Path(final_video).name}")
+        playlist_title = Path(final_video).stem
+        playlist_url = ""
+    else:
+        playlist_title, final_video, playlist_url = run_add_music(video_file)
+
+    if final_video:
+        start_alerts()
+        choice = input_with_timeout(
+            "📝 Upload the video? (y/n): ",
+            timeout=30, require_input=False, default="y"
+        )
+        stop_all_alerts()
+        if choice.lower() == "y":
+            # chapters tied to the *merged* file; reuse same text
+            if not chapter_text:
+                chapter_text = load_chapter_text_for(video_file)
+            upload_video(final_video, playlist_title, playlist_url, chapter_text, privacy_status="unlisted")
+
     start_watcher_then_process()
