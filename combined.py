@@ -150,11 +150,11 @@ YOUTUBE_UPLOAD_SCOPE = config["YOUTUBE_UPLOAD_SCOPE"]
 YOUTUBE_API_SERVICE_NAME = config["YOUTUBE_API_SERVICE_NAME"]
 YOUTUBE_API_VERSION = config["YOUTUBE_API_VERSION"]
 
-
 # GLOBAL VARS
 files_to_delete = []
 drive_letter_global = None
 last_event_time = time.time()
+is_copying = False
 
 with open(os.path.join(SCRIPT_FOLDER, "config.json")) as f:
     config = json.load(f)
@@ -210,6 +210,243 @@ def is_valid_mp4(filepath):
         print(f"Error validating {filepath}: {e}")
         return False
 
+def process_gopro_with_music_in_one_pass():
+    script_root = Path(VIDEO_FOLDER)
+
+    all_files = list(script_root.glob("*.mp4"))
+    mp4_files = [
+        f for f in all_files
+        if is_valid_mp4(f)
+        and "combined-" not in f.name.lower()
+        and "-music" not in f.name.lower()
+    ]
+
+    print(f"✅ Valid MP4 files: {[f.name for f in mp4_files]}")
+    if not mp4_files:
+        return None, None, None, None
+
+    # --- Group files exactly like run_flipme ---
+    groups = {}
+    for file in mp4_files:
+        key = extract_timestamp_key(file.name)
+        groups.setdefault(key, []).append(file)
+
+    for key in groups:
+        groups[key].sort(key=lambda f: get_time_from_name(f.name))
+
+    # --- FIX: sort groups by full datetime, not just time-of-day ---
+    def parse_timestamp_key(key):
+        return datetime.strptime(key, "%Y-%m-%d-%H-%M-%S")
+
+    sorted_group_keys = sorted(groups.keys(), key=parse_timestamp_key)
+
+
+    # --- Chapter durations + total duration (for music selection) ---
+    chapter_durations = []
+    total_duration_sec = 0
+    for key in sorted_group_keys:
+        total = 0
+        for f in groups[key]:
+            d = get_duration_seconds(f)
+            total += d
+        chapter_durations.append((key, total))
+        total_duration_sec += total
+
+    print(f"Duration of combined video (from chunks): {total_duration_sec/60:.1f} mins")
+
+    # --- Build concat list file (same as run_flipme) ---
+    list_file = script_root / "all-files.txt"
+    with open(list_file, "w", encoding="utf-8") as f:
+        for key in sorted_group_keys:
+            for file in groups[key]:
+                f.write(f"file '{file}'\n")
+
+    # --- Naming for final output file ---
+    first_key = sorted_group_keys[0]
+    date = "-".join(first_key.split("-")[0:3])
+    earliest_time = get_time_from_name(groups[first_key][0].name)
+    output_file = script_root / f"combined-{date}-{earliest_time}-music.mp4"
+    if output_file.exists():
+        output_file = get_unique_filename(output_file)
+
+    # --- PLAYLIST SELECTION + AUDIO BUILD ---
+    playlists = search_youtube_playlists(API_KEY, SEARCH_TERM)
+    playlist_info = []
+    cache = load_cache()
+
+    for pl in playlists:
+        pl_id = pl["id"]["playlistId"]
+        title = pl["snippet"]["title"]
+        duration = get_playlist_duration(API_KEY, pl_id, cache)
+        if total_duration_sec <= duration:
+            diff = abs(duration - total_duration_sec)
+            playlist_info.append({
+                "title": title,
+                "id": pl_id,
+                "duration": duration,
+                "diff": diff,
+                "url": f"https://www.youtube.com/playlist?list={pl_id}"
+            })
+    playlist_info.sort(key=lambda x: x["diff"])
+
+    for i, p in enumerate(playlist_info, start=1):
+        match_pct = (p['duration'] / total_duration_sec) * 100
+        print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
+
+    default_choice = random.randint(1, len(playlist_info))
+    start_alerts()
+    choice = input_with_timeout(
+        "📝 Enter the number of the playlist you want to download: ",
+        timeout=60, default=default_choice, cast_type=int,
+        require_input=False, retries=0
+    )
+    stop_all_alerts()
+    selected = playlist_info[choice-1]
+
+    playlist_clean_name = sanitize_filename(selected["title"])
+    DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
+
+    entry_urls = get_limited_playlist_entries(
+        API_KEY, selected['url'], total_duration_sec,
+        DOWNLOAD_FOLDER, cache, buffer_sec=30
+    )
+    unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+
+    total_audio = ensure_audio_matches_video(
+        None,
+        DOWNLOAD_FOLDER,
+        API_KEY, selected['url'], cache, buffer_sec=30
+    )
+
+    output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
+    delete_if_exists(output_mp3)
+    merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
+
+    # --- ONE-PASS MERGE + MUSIC USING STDOUT → STDIN STREAMING ---
+    print(f"🎬 Merging chunks and adding music in one pass → {output_file.name}")
+
+    # Build filter_complex like mix_audio_with_video, but using total_duration_sec
+    duration = total_duration_sec
+    first_video = str(groups[first_key][0])
+    if has_audio_stream(first_video):
+        filter_complex = (
+            f"[0:a]atrim=duration={duration}[a0];"
+            f"[1:a]atrim=duration={duration}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+        )
+    else:
+        filter_complex = (
+            f"anullsrc=channel_layout=stereo:sample_rate=44100[a0];"
+            f"[1:a]atrim=duration={duration}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+        )
+
+    # FFmpeg #1: concat GoPro chunks → stdout (MPEG-TS stream)
+    merge_proc = subprocess.Popen(
+        [
+            FFMPEG_PATH, "-f", "concat", "-safe", "0",
+            "-i", str(list_file),
+            "-c", "copy",
+            "-f", "mpegts",
+            "pipe:1"
+        ],
+        stdout=subprocess.PIPE
+    )
+
+    # FFmpeg #2: read MPEG-TS from stdin, mix audio, write final MP4 (Option C)
+    mix_proc = subprocess.run(
+        [
+            FFMPEG_PATH, "-y",
+            "-f", "mpegts",
+            "-i", "pipe:0",
+            "-i", output_mp3,
+            "-filter_complex", filter_complex,
+            "-map", "0:v",
+            "-map", "[aout]",
+            "-metadata:s:v", "rotate=180",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            str(output_file)
+        ],
+        stdin=merge_proc.stdout,
+        check=True
+    )
+
+    merge_proc.wait()
+    delete_if_exists(list_file)
+
+    if output_file.exists() and output_file.stat().st_size > 0:
+        # --- Build chapter text for the final file ---
+        chapter_text = build_youtube_chapters(chapter_durations)
+
+        # --- Save unified metadata JSON (playlist + chapters + video info) ---
+        meta = {
+            "playlist": {
+                "title": selected["title"],
+                "url": selected["url"],
+                "duration_sec": selected["duration"],
+                "duration_min": round(selected["duration"] / 60, 2),
+                "match_percent": round((selected["duration"] / total_duration_sec) * 100, 2)
+            },
+            "video": {
+                "output_file": str(output_file),
+                "total_duration_sec": total_duration_sec,
+                "total_duration_min": round(total_duration_sec / 60, 2)
+            },
+            "chapters": [
+                {"key": key, "duration_sec": dur, "duration_min": round(dur / 60, 2)}
+                for key, dur in chapter_durations
+            ],
+            "chapter_text": chapter_text
+        }
+
+        meta_file = Path(str(output_file) + ".meta.json")
+        with open(meta_file, "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, indent=4)
+        print(f"🗂️ Saved metadata JSON to: {meta_file.name}")
+
+        # --- Cleanup original GoPro chunks ---
+        print("🧹 Cleaning up original GoPro files...")
+        for key in sorted_group_keys:
+            for file in groups[key]:
+                delete_if_exists(file)
+        print("🧼 All original chunks deleted (one-pass mode).")
+
+        save_cache(cache)
+        print(f"🎉 Final merged file with music ready: {output_file.name}")
+
+        final_output = str(output_file)
+        playlist_title = selected["title"]
+        playlist_url = selected["url"]
+
+        # --- NEW: upload from inside one-pass ---
+        start_alerts()
+        choice = input_with_timeout(
+            "📝 Upload the new music video now? (y/n): ",
+            timeout=30,
+            require_input=False,
+            default="y"
+        )
+        stop_all_alerts()
+
+        if choice.lower() == "y":
+            upload_video(
+                final_output,
+                playlist_title,
+                playlist_url,
+                chapter_text,
+                privacy_status="unlisted"
+            )
+
+            # Cleanup final outputs after successful upload
+            cleanup_final_outputs(final_output, meta_file)
+
+        return final_output, chapter_text, playlist_title, playlist_url
+
+    print("❌ One-pass merge + music failed or output file missing.")
+    return None, None, None, None
+
+'''
 def run_flipme():
     script_root = Path(VIDEO_FOLDER)
 
@@ -289,6 +526,7 @@ def run_flipme():
 
     print("❌ Merge failed or output file missing.")
     return None, None
+'''
 
 def format_ts(sec):
     h = sec // 3600
@@ -321,10 +559,20 @@ def get_duration_seconds(path):
 # STEP 2: ADD MUSIC FUNCTIONS
 # =========================
 def load_chapter_text_for(video_path: str) -> str:
-    cf = Path(video_path + ".chapters.txt")
-    if cf.exists():
-        return cf.read_text(encoding="utf-8")
-    print(f"⚠️ No chapter file found for {video_path}")
+    meta_file = Path(video_path + ".meta.json")
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            chapter_text = meta.get("chapter_text", "")
+            if chapter_text:
+                return chapter_text
+            print(f"⚠️ No chapter_text found inside meta for {video_path}")
+            return ""
+        except Exception as e:
+            print(f"❌ Failed to read meta.json for {video_path}: {e}")
+            return ""
+
+    print(f"⚠️ No meta.json file found for {video_path}")
     return ""
 
 def load_cache():
@@ -668,7 +916,6 @@ def unified_download_playlist(entry_urls, output_path, max_workers=8):
     for r in results:
         print(r)
 
-
 def fast_audio_duration(file):
     """Return duration in seconds using ffprobe metadata."""
     try:
@@ -797,7 +1044,6 @@ def sanitize_filename(filename, replacement=""):
         name = "untitled"
     return f"{name}{ext}"
 
-#'''
 def run_add_music(video_file):
     if not video_file:
         return None, None, None
@@ -868,21 +1114,56 @@ def run_add_music(video_file):
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
 # =========================
-def print_progress(progress, start_time):
+def print_progress(status, start_time, last_bytes=[0], last_time=[None]):
+    uploaded = status.resumable_progress
+    total = status.total_size
+
+    if not total:
+        return  # avoid division by zero
+
+    progress = uploaded / total
+
+    # Progress bar
     bar_len = 30
     filled = int(bar_len * progress)
     bar = "█" * filled + "░" * (bar_len - filled)
 
-    elapsed = time.time() - start_time
-    if progress > 0:
-        eta = elapsed / progress - elapsed
+    # Timing
+    now = time.time()
+    elapsed = now - start_time
+
+    # Instant speed
+    if last_time[0] is None:
+        inst_speed = 0
     else:
-        eta = 0
+        dt = now - last_time[0]
+        db = uploaded - last_bytes[0]
+        inst_speed = db / dt if dt > 0 else 0
+
+    # Average speed
+    avg_speed = uploaded / elapsed if elapsed > 0 else 0
+
+    # ETA
+    remaining = total - uploaded
+    eta = remaining / avg_speed if avg_speed > 0 else 0
+
+    # Update rolling state
+    last_bytes[0] = uploaded
+    last_time[0] = now
+
+    def fmt_bytes(b):
+        for unit in ["B","KB","MB","GB"]:
+            if b < 1024:
+                return f"{b:.1f}{unit}"
+            b /= 1024
+        return f"{b:.1f}TB"
 
     sys.stdout.write(
-        f"\rUploading: [{bar}] {int(progress*100)}%  "
-        f"Elapsed: {format_time(elapsed)}  "
-        f"ETA: {format_time(eta)}"
+        f"\rUploading: [{bar}] {progress*100:5.1f}%  "
+        f"{fmt_bytes(uploaded)}/{fmt_bytes(total)}  "
+        f"⚡ {inst_speed/1024/1024:4.2f} MB/s inst  "
+        f"📈 {avg_speed/1024/1024:4.2f} MB/s avg  "
+        f"ETA {time.strftime('%M:%S', time.gmtime(eta))}"
     )
     sys.stdout.flush()
 
@@ -951,16 +1232,55 @@ def get_authenticated_service():
 
     return build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, http=authed_http)
 
-def resumable_upload(insert_request):
+def start_timer_thread(stop_event, total_bytes, assumed_speed_bps=100*1024*1024):
+    start = time.time()
+
+    def fmt_time(t):
+        return time.strftime("%M:%S", time.gmtime(t))
+
+    def fmt_bytes(b):
+        for unit in ["B","KB","MB","GB"]:
+            if b < 1024:
+                return f"{b:.1f}{unit}"
+            b /= 1024
+        return f"{b:.1f}TB"
+    while not stop_event.is_set():
+        elapsed = time.time() - start
+        uploaded_est = min(elapsed * assumed_speed_bps, total_bytes)
+        progress = uploaded_est / total_bytes
+        remaining = total_bytes - uploaded_est
+        eta = remaining / assumed_speed_bps if assumed_speed_bps > 0 else 0
+        bar_len = 30
+        filled = int(bar_len * progress)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        sys.stdout.write(
+            f"\r[{bar}] {progress*100:5.1f}%  "
+            f"{fmt_bytes(uploaded_est)}/{fmt_bytes(total_bytes)}  "
+            f"⏱ {fmt_time(elapsed)}  ETA {fmt_time(eta)}"
+        )
+        sys.stdout.flush()
+        time.sleep(1)
+
+    # Clear the line when done
+    sys.stdout.write("\r" + " " * 120 + "\r")
+    sys.stdout.flush()
+
+def resumable_upload(insert_request, file_size):
     response, error, retry = None, None, 0
     start_time = time.time()
+    stop_event = threading.Event()
+    threading.Thread(
+        target=start_timer_thread,
+        args=(stop_event, file_size),
+        daemon=True
+    ).start()
     while response is None:
         try:
+
             status, response = insert_request.next_chunk()
-            if status:
-                print_progress(status.progress(), start_time)
             if response and "id" in response:
                 total_time = time.time() - start_time
+                stop_event.set()
                 video_url = f"https://youtu.be/{response['id']}"
                 # Fetch latest Strava activity ID
                 strava_activity_id = get_latest_strava_activity()
@@ -970,7 +1290,20 @@ def resumable_upload(insert_request):
                     resp = requests.get(webhook_url)
                     print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
                 print(f"✅ Uploaded: {video_url}")
-                print(f"⏱️ Total time: {total_time:.1f}s")
+                # Convert total_time into h/m/s
+                seconds = int(total_time)
+                mins, secs = divmod(seconds, 60)
+                hours, mins = divmod(mins, 60)
+
+                if hours > 0:
+                    readable = f"{hours}h {mins}m {secs}s"
+                elif mins > 0:
+                    readable = f"{mins}m {secs}s"
+                else:
+                    readable = f"{secs}s"
+
+                print(f"⏱️ Total time: {readable}")
+
                 try:
                     pyperclip.copy(video_url)
                 except Exception:
@@ -1003,12 +1336,13 @@ def initialize_upload(youtube, options):
             selfDeclaredMadeForKids=False
         )
     )
+    file_size = os.path.getsize(options.file)
     insert_request = youtube.videos().insert(
         part=",".join(body.keys()),
         body=body,
         media_body=MediaFileUpload(options.file, chunksize=-1, resumable=True)
     )
-    resumable_upload(insert_request)
+    resumable_upload(insert_request, file_size)
 
 def format_time(seconds):
     """Convert seconds into H:MM:SS format."""
@@ -1034,6 +1368,7 @@ def get_latest_strava_activity():
 def upload_video(video_file, playlist_title, playlist_url, chapter_text, privacy_status="unlisted"):
     strava_activity_id = get_latest_strava_activity()
     strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
+
     args = Namespace(
         file=video_file,
         title=Path(video_file).stem,
@@ -1046,11 +1381,20 @@ def upload_video(video_file, playlist_title, playlist_url, chapter_text, privacy
         category="22",
         privacyStatus=privacy_status
     )
+
     youtube = get_authenticated_service()
+
     try:
         initialize_upload(youtube, args)
+
+        # NEW: cleanup using meta.json instead of chapters.txt
+        meta_path = Path(str(video_file) + ".meta.json")
+        cleanup_final_outputs(video_file, meta_path)
+
     except HttpError as e:
         print(f"🚨 HTTP error {e.resp.status} occurred:\n{e.content}")
+
+
 
 # =========================
 # Generates dummy GoPro-style videos with overlays and sets file modification times.
@@ -1138,94 +1482,78 @@ def get_file_sizes():
         if not f.name.lower().endswith("-music.mp4")
     }
 
-class SettlingHandler(FileSystemEventHandler):
-    def dispatch(self, event):
-        global last_event_time
-        if not event.is_directory:
-            ext = os.path.splitext(event.src_path)[1].lower()
-            if ext in WATCH_EXTENSIONS:
-                last_event_time = time.time()
-                print(f"📁 Event: {event.event_type.upper()} → {event.src_path}")
-
-def wait_for_settle():
-    print("⏳ Waiting for directory to settle...")
-
-    previous_sizes = get_file_sizes()
-
-    # Capture the moment settle-check begins
-    settle_start_time = time.time()
-
-    # Pretend we've already been stable for the full window
-    stable_start = time.time() - SETTLE_TIME
-
-    POLL = CHECK_INTERVAL  # your 10s interval
-
-    while True:
-        time.sleep(POLL)
-
-        current_sizes = get_file_sizes()
-
-        # Detect size changes
-        changed_files = [
-            f for f in current_sizes
-            if current_sizes[f] != previous_sizes.get(f)
-        ]
-
-        if changed_files:
-            print("📏 File sizes changed:")
-            for f in changed_files:
-                old = previous_sizes.get(f, 0)
-                new = current_sizes[f]
-                print(f"   - {f.name}: {old} → {new}")
-            previous_sizes = current_sizes
-            stable_start = time.time()  # reset unified timer
-            continue
-
-        # Detect recent events, but ignore events that happened BEFORE this function started
-        since_event = time.time() - last_event_time
-        event_is_new = last_event_time >= settle_start_time
-
-        if event_is_new and since_event < SETTLE_TIME:
-            print(f"🕒 Recent file event detected ({int(since_event)}s ago). Waiting...", end="\r")
-            stable_start = time.time()  # reset unified timer
-            continue
-
-        # If we reach here: no size changes AND no new events
-        elapsed = time.time() - stable_start
-
-        # First time we enter stable state (only prints once)
-        if elapsed >= 0 and elapsed < POLL:
-            print("📦 File sizes stable. Starting settle timer...              ")
-
-        # Unified 300-second window satisfied
-        if elapsed >= SETTLE_TIME:
-            print("✅ Directory settled. No changes and stable sizes.           ")
-            break
-
-def process_video_file(video_file, chapter_durations):
+def process_video_file(video_file, meta_json_path):
     if not video_file:
-        #print("No combined video created.")
         return
-    else:
-        if has_music_version(video_file):
-            print(f"🎵 Skipping {video_file} — music version already exists.")
+
+    if has_music_version(video_file):
+        print(f"🎵 Skipping {video_file} — music version already exists.")
+        return
+
+    playlist_title, final_video, playlist_url = run_add_music(video_file)
+
+    if final_video:
+        # STRICT MODE: require meta.json instead of chapters.txt
+        if not meta_json_path or not Path(meta_json_path).exists():
+            print(f"❌ Metadata file missing for {final_video}")
+            print("ℹ️ Upload aborted (metadata required).")
             return
-        playlist_title, final_video, playlist_url = run_add_music(video_file)
-        if final_video:
-            start_alerts()
-            choice = input_with_timeout("🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ", timeout=30, require_input=False, default="y")
-            stop_all_alerts()
-            if choice == "y":
-                upload_video(final_video, playlist_title, playlist_url, chapter_durations)
+
+        # Load chapter text from meta.json
+        try:
+            meta = json.loads(Path(meta_json_path).read_text(encoding="utf-8"))
+            chapter_text = meta.get("chapter_text", "")
+            if not chapter_text:
+                print(f"⚠️ No chapter_text found in meta.json for {final_video}")
+                print("ℹ️ Upload aborted (chapters required).")
+                return
+        except Exception as e:
+            print(f"❌ Failed to read meta.json: {e}")
+            print("ℹ️ Upload aborted.")
+            return
+
+        start_alerts()
+        choice = input_with_timeout(
+            "🛠️ Would you like to upload the video? This uses a lot of API daily credits. 1600 out of 10000. (y/n): ",
+            timeout=30, require_input=False, default="y"
+        )
+        stop_all_alerts()
+
+        if choice == "y":
+            upload_video(final_video, playlist_title, playlist_url, chapter_text)
+
+def wait_until_drive_is_stable(drive_letter, wait_time=1.0, retries=10):
+    """Wait until file sizes on the drive stop changing."""
+    base = f"{drive_letter}:\\"
+    last_sizes = {}
+
+    for _ in range(retries):
+        current_sizes = {}
+        for root, _, files in os.walk(base):
+            for f in files:
+                path = os.path.join(root, f)
+                try:
+                    current_sizes[path] = os.path.getsize(path)
+                except:
+                    current_sizes[path] = -1
+
+        if current_sizes == last_sizes:
+            return True
+
+        last_sizes = current_sizes
+        time.sleep(wait_time)
+
+    return False
 
 def process_all_new_files():
     print("🚀 Starting batch processing...")
     #video_file = run_flipme()
-    result = run_flipme()
+    #result = run_flipme()
+    result = process_gopro_with_music_in_one_pass()
     if not result:
         return
 
-    video_file, chapter_durations = result
+    video_file, chapter_durations, playlist_title, playlist_url = result
     candidates = [
         f for f in Path(VIDEO_FOLDER).glob("*.mp4")
         if not f.name.lower().endswith("-music.mp4") and f.stat().st_size > 0
@@ -1391,25 +1719,29 @@ def copy_gopro_files(drive_letter):
     global files_to_delete, drive_letter_global
     drive_letter_global = drive_letter  # remember which drive we’re working with
     mount_point = f"{drive_letter}:\\"
-
-    for root, _, files in os.walk(mount_point):
-        for file in files:
-            name_upper = file.upper()
-            if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
-                src = os.path.join(root, file)
-                dst = os.path.join(VIDEO_FOLDER, file)
-                if not os.path.exists(dst):
-                    print(f"📥 Starting copy: {src} -> {dst}")
-                    try:
-                        copy_with_progress(src, dst)
-                        if os.path.getsize(src) == os.path.getsize(dst):
-                            print(f"✅ Finished copying {file}, marking for deletion")
-                            files_to_delete.append(src)
-                            files_to_delete.extend(find_sidecars(root, file))
-                        else:
-                            print(f"⚠️ Size mismatch for {file}, not deleting")
-                    except Exception as e:
-                        print(f"⚠️ Error copying {src}: {e}")
+    global is_copying
+    is_copying = True
+    try:
+        for root, _, files in os.walk(mount_point):
+            for file in files:
+                name_upper = file.upper()
+                if file.lower().endswith(".mp4") and ("GX" in name_upper or "GOPR" in name_upper):
+                    src = os.path.join(root, file)
+                    dst = os.path.join(VIDEO_FOLDER, file)
+                    if not os.path.exists(dst):
+                        print(f"📥 Starting copy: {src} -> {dst}")
+                        try:
+                            copy_with_progress(src, dst)
+                            if os.path.getsize(src) == os.path.getsize(dst):
+                                print(f"✅ Finished copying {file}, marking for deletion")
+                                files_to_delete.append(src)
+                                files_to_delete.extend(find_sidecars(root, file))
+                            else:
+                                print(f"⚠️ Size mismatch for {file}, not deleting")
+                        except Exception as e:
+                            print(f"⚠️ Error copying {src}: {e}")
+    finally:
+        is_copying = False
 
 def confirm_and_delete():
     global files_to_delete, drive_letter_global
@@ -1421,7 +1753,8 @@ def confirm_and_delete():
         return
     #print("DEBUG: files_to_delete =", files_to_delete)
     start_alerts()
-    choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=True, default="n").strip().lower()
+    choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=False, default="n").strip().lower()
+    stop_all_alerts()
     if choice == "y":
         for f in set(files_to_delete):
             try:
@@ -1434,7 +1767,6 @@ def confirm_and_delete():
         drive_letter_global = None
     else:
         print("ℹ️ Files left on the GoPro drive.")
-    stop_all_alerts()
 
 # --- USB Listener Thread ---
 def usb_listener():
@@ -1444,47 +1776,193 @@ def usb_listener():
         notification_type="Creation",
         wmi_class="Win32_VolumeChangeEvent"
     )
+
     while True:
         event = watcher()
-        if event.EventType == 2:  # Device arrival
-            drive_letter = event.DriveName.strip(":\\")
-            if not drive_letter:  # ignore bogus events
-                continue
-            if drive_letter == drive_letter_global:
-                continue  # ignore duplicate arrival events
-            print(f"💽 USB inserted: {drive_letter}:\\")
-            copy_gopro_files(drive_letter)
+        if event.EventType != 2:  # Only care about arrivals
+            continue
+
+        drive_letter = event.DriveName.strip(":\\")
+        if not drive_letter:
+            continue
+
+        # Prevent double-firing for the same drive
+        global drive_letter_global
+        if drive_letter == drive_letter_global:
+            continue
+        drive_letter_global = drive_letter
+
+        print(f"💽 USB inserted: {drive_letter}:\\")
+
+        # --- 1. Wait for the drive to actually mount ---
+        root_path = f"{drive_letter}:\\"
+        for _ in range(20):  # ~10 seconds max
+            if os.path.isdir(root_path):
+                break
+            time.sleep(0.5)
+        else:
+            print(f"⚠️ Drive {drive_letter}:\\ never mounted — skipping.")
+            continue
+
+        # --- 2. Wait for the filesystem to settle ---
+        if not wait_until_drive_is_stable(drive_letter):
+            print(f"⚠️ Drive {drive_letter}:\\ never stabilized — skipping.")
+            continue
+
+        # --- 3. Now it's safe to copy ---
+        copy_gopro_files(drive_letter)
 
 
-# --- Your Watchdog Loop ---
+# ============================
+#  SAFE WATCHER REWRITE
+# ============================
+
+pending_files = set()
+last_event_time = None
+EVENT_SETTLE_SECONDS = 1.0
+
+def is_valid_input_file(path: Path) -> bool:
+    """Return True only for real GoPro input files that should be processed."""
+    if not path.exists():
+        return False
+
+    if path.stat().st_size == 0:
+        return False
+
+    name = path.name.lower()
+
+    # Ignore output files
+    if name.startswith("combined-"):
+        return False
+    if name.endswith("-music.mp4"):
+        return False
+    if name.endswith("-flipped.mp4"):
+        return False
+
+    # Ignore metadata files
+    if name.endswith(".meta.json"):
+        return False
+
+    # Ignore temp files
+    if name.endswith(".tmp") or name.endswith(".partial"):
+        return False
+
+    # Only MP4s from GoPro
+    return name.endswith(".mp4")
+
+class SettlingHandler(FileSystemEventHandler):
+    """Filters noisy Windows events and only registers real input files."""
+
+    def on_modified(self, event):
+        global last_event_time
+
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+
+        # Only register valid input files
+        if is_valid_input_file(path):
+            pending_files.add(path)
+            last_event_time = time.time()
+
+    # Some GoPro writes trigger CREATED instead of MODIFIED
+    def on_created(self, event):
+        self.on_modified(event)
+
+
+def wait_for_settle():
+    """Wait until filesystem events stop firing for a moment."""
+    global last_event_time
+
+    while True:
+        now = time.time()
+        if last_event_time and (now - last_event_time) < EVENT_SETTLE_SECONDS:
+            time.sleep(0.2)
+        else:
+            break
+
+def cleanup_final_outputs(final_video_path, meta_json_path):
+    """
+    Ask user whether to delete the merged final MP4 and its metadata file.
+    Returns True if files were deleted, False otherwise.
+    """
+    choice = input("🗑️ Delete merged MP4 and metadata? (y/N): ").strip().lower()
+
+    if choice != "y":
+        print("❎ Keeping merged MP4 + metadata.")
+        return False
+
+    deleted_any = False
+
+    # Delete final merged video
+    if final_video_path and os.path.exists(final_video_path):
+        try:
+            os.remove(final_video_path)
+            print(f"   Removed {final_video_path}")
+            deleted_any = True
+        except Exception as e:
+            print(f"⚠️ Error deleting {final_video_path}: {e}")
+
+    # Delete metadata JSON
+    if meta_json_path and os.path.exists(meta_json_path):
+        try:
+            os.remove(meta_json_path)
+            print(f"   Removed {meta_json_path}")
+            deleted_any = True
+        except Exception as e:
+            print(f"⚠️ Error deleting {meta_json_path}: {e}")
+
+    if deleted_any:
+        print("✅ Final merged video + metadata deleted.")
+    else:
+        print("⚠️ Nothing was deleted (files missing or errors).")
+
+    return deleted_any
+
 def start_watcher_then_process():
     global last_event_time
+
     observer = Observer()
     observer.schedule(SettlingHandler(), path=VIDEO_FOLDER, recursive=False)
     observer.start()
 
     print(f"👀 Watching {VIDEO_FOLDER} for new files...")
 
-    # Run USB listener in parallel
+    # USB listener stays as-is
     threading.Thread(target=usb_listener, daemon=True).start()
 
     try:
         while True:
-            if last_event_time:  # only run if handler saw an event
-                wait_for_settle()          # settle logic
-                process_all_new_files()    # batch processing
-                if drive_letter_global:
-                    confirm_and_delete()
+            # Only trigger processing if:
+            # 1. An event happened
+            # 2. We have real pending files
+            if last_event_time and pending_files and not is_copying:
+                wait_for_settle()
+                # Re-validate pending files before processing
+                real_files = [f for f in pending_files if is_valid_input_file(f)]
+                pending_files.clear()
+                if real_files:
+                    print(f"📦 Processing batch of {len(real_files)} new files...")
+                    final_output, _, _, _ = process_all_new_files()
+                    if drive_letter_global:
+                        # Prevent double delete prompt if the one-pass function already removed the files
+                        if final_output and os.path.exists(final_output):
+                            confirm_and_delete()
+                        else:
+                            print("ℹ️ Final merged MP4 already deleted — skipping delete prompt.")
                 print("🔁 Returning to watch mode...\n")
-                last_event_time = None     # reset so we don't re-trigger
+                last_event_time = None
             else:
-                time.sleep(1)  # idle quietly until an event occurs
+                time.sleep(0.5)
+
     except KeyboardInterrupt:
         print("❌ Watcher stopped by user.")
+
     finally:
         observer.stop()
         observer.join()
-## END USB DRIVE MOD
+
 
 def has_music_version(file_path):
     base, ext = os.path.splitext(file_path)
@@ -1635,51 +2113,97 @@ def stop_all_alerts():
 # MAIN PIPELINE
 # =========================
 if __name__ == "__main__":
-    script_root = Path(VIDEO_FOLDER)
+    script_root = Path(VIDEO_FOLDER).resolve()
 
-    # Detect state
+    all_mp4s = list(script_root.glob("*.mp4"))
+
     raw_chunks = [
-        f for f in script_root.glob("*.mp4")
-        if is_valid_mp4(f)
-        and "combined-" not in f.name.lower()
-        and "-music" not in f.name.lower()
-        and "flipped" not in f.name.lower()
+        f for f in all_mp4s
+        if is_valid_input_file(f)
     ]
-    music_candidates = sorted(
-        [f for f in script_root.glob("*.mp4") if f.name.lower().endswith("-music.mp4")]
-    )
-    merged_candidates = sorted(
-        [f for f in script_root.glob("combined-*.mp4")
-         if not f.name.lower().endswith("-music.mp4")]
-    )
+
+    music_candidates = [
+        f for f in all_mp4s
+        if f.name.lower().endswith("-music.mp4")
+    ]
+
+    merged_candidates = [
+        f for f in all_mp4s
+        if f.name.lower().startswith("combined-")
+        and not f.name.lower().endswith("-music.mp4")
+    ]
+
+    print("🔍 raw_chunks:", [f.name for f in raw_chunks])
+    print("🔍 merged_candidates:", [f.name for f in merged_candidates])
+    print("🔍 music_candidates:", [f.name for f in music_candidates])
 
     video_file = None
     chapter_text = ""
 
     # 1) If raw chunks exist → merge
     if raw_chunks:
-        video_file, chapter_text = run_flipme()
+        video_file, chapter_text, playlist_title, playlist_url = process_gopro_with_music_in_one_pass()
         if not video_file:
             print("❌ Merge failed. Exiting.")
             exit()
+
+        print(f"🎬 One-pass final video: {video_file}")
+        print(f"📄 Chapters loaded ({len(chapter_text.splitlines())} lines)")
+        print(f"🎵 Playlist: {playlist_title}")
+        print(f"🔗 Playlist URL: {playlist_url or '(none)'}")
+
+        start_watcher_then_process()
+        exit()
+
     # 2) Else if merged file exists → use it
     elif merged_candidates:
         video_file = str(merged_candidates[0])
         chapter_text = load_chapter_text_for(video_file)
+
     # 3) Else if only music file exists → upload only
     elif music_candidates:
         final_video = str(music_candidates[0])
-        chapter_text = load_chapter_text_for(final_video.replace("-music.mp4", ".mp4"))
+        meta_path = Path(final_video + ".meta.json")
+
+        print(f"🎬 Final music video: {final_video}")
+        print(f"🗂️ Metadata file: {meta_path}")
+
+        # STRICT MODE: require meta.json
+        if not meta_path.exists():
+            print(f"❌ Metadata file missing for {final_video}")
+            print("ℹ️ Upload aborted (metadata required).")
+            start_watcher_then_process()
+            exit()
+
+        # Load metadata
+        meta = json.loads(meta_path.read_text())
+        chapter_text = meta.get("chapter_text", "")
+        playlist_title = meta["playlist"]["title"]
+        playlist_url = meta["playlist"]["url"]
+
         start_alerts()
         choice = input_with_timeout(
-            f"📤 Upload existing music video '{Path(final_video).name}'? (y/n): ",
-            timeout=30, require_input=False, default="n"
+            "📝 Upload the existing music video? (y/n): ",
+            timeout=30,
+            require_input=False,
+            default="y"
         )
         stop_all_alerts()
+
         if choice.lower() == "y":
-            upload_video(final_video, Path(final_video).stem, "", chapter_text, privacy_status="unlisted")
+            upload_video(
+                final_video,
+                playlist_title,
+                playlist_url,
+                chapter_text,
+                privacy_status="unlisted"
+            )
+
+            cleanup_final_outputs(final_video, meta_path)
+
         start_watcher_then_process()
         exit()
+
     else:
         print("📁 No eligible MP4 files found.")
 
@@ -1695,15 +2219,13 @@ if __name__ == "__main__":
         if choice.lower() == "y":
             generate_dummy_gopro_clips(VIDEO_FOLDER)
             print("✅ Dummy clips generated. Starting merge...")
-            video_file, chapter_text = run_flipme()
+            video_file, chapter_text, playlist_title, playlist_url = process_gopro_with_music_in_one_pass()
         else:
             print("⏳ Entering watch mode...")
             start_watcher_then_process()
             exit()
 
-
     print(f"🎬 Final merged file: {video_file}")
-    print(f"📄 Chapter file: {video_file}.chapters.txt")
 
     # Add music if no music version yet
     existing_music = [
@@ -1713,8 +2235,17 @@ if __name__ == "__main__":
     if existing_music:
         final_video = str(existing_music[0])
         print(f"🎵 Using existing music video: {Path(final_video).name}")
-        playlist_title = Path(final_video).stem
-        playlist_url = ""
+
+        # Load metadata
+        meta_path = Path(final_video + ".meta.json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            playlist_title = meta["playlist"]["title"]
+            playlist_url = meta["playlist"]["url"]
+        else:
+            playlist_title = Path(final_video).stem
+            playlist_url = ""
+
     else:
         playlist_title, final_video, playlist_url = run_add_music(video_file)
 
@@ -1722,13 +2253,16 @@ if __name__ == "__main__":
         start_alerts()
         choice = input_with_timeout(
             "📝 Upload the video? (y/n): ",
-            timeout=30, require_input=False, default="y"
+            timeout=30,
+            require_input=False,
+            default="y"
         )
         stop_all_alerts()
+
         if choice.lower() == "y":
-            # chapters tied to the *merged* file; reuse same text
             if not chapter_text:
                 chapter_text = load_chapter_text_for(video_file)
+
             upload_video(final_video, playlist_title, playlist_url, chapter_text, privacy_status="unlisted")
 
     start_watcher_then_process()
