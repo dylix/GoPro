@@ -47,12 +47,14 @@ from mutagen.mp3 import MP3
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 HANDLE_EXE = os.path.join(os.path.dirname(__file__), "handle64.exe")
+stdout_lock = threading.Lock()
 
 # Windows-specific imports
 if os.name == 'nt':
@@ -193,11 +195,12 @@ def get_unique_filename(base_name):
     return base
 
 def extract_timestamp_key(filename):
-    # Assumes format like '2025-10-09-07-31-48-GX010835.MP4'
-    parts = filename.split('-GX')
-    if len(parts) > 1:
-        return parts[0]  # returns '2025-10-09-07-31-48'
-    return filename  # fallback
+    # Example filename:
+    # 2026-06-07-05-42-57-GX011078.MP4
+    base = os.path.basename(filename)
+    parts = base.split("-")
+    # YYYY-MM-DD-HH-MM-SS
+    return "-".join(parts[0:6])
 
 def is_valid_mp4(filepath):
     try:
@@ -213,6 +216,9 @@ def is_valid_mp4(filepath):
 def process_gopro_with_music_in_one_pass():
     script_root = Path(VIDEO_FOLDER)
 
+    def _random_hex_suffix(k=4):
+        return ''.join(random.choices('0123456789abcdef', k=k))
+
     all_files = list(script_root.glob("*.mp4"))
     mp4_files = [
         f for f in all_files
@@ -223,179 +229,262 @@ def process_gopro_with_music_in_one_pass():
 
     print(f"✅ Valid MP4 files: {[f.name for f in mp4_files]}")
     if not mp4_files:
-        return None, None, None, None
+        print("❌ No valid GoPro MP4 files found.")
+        return
 
-    # --- Group files exactly like run_flipme ---
+    # --- Group files by day (YYYY-MM-DD) ---
     groups = {}
     for file in mp4_files:
-        key = extract_timestamp_key(file.name)
-        groups.setdefault(key, []).append(file)
+        full_key = extract_timestamp_key(file.name)
+        day_key = "-".join(full_key.split("-")[0:3])  # YYYY-MM-DD
+        groups.setdefault(day_key, []).append(file)
 
+    # Sort files within each day by time
     for key in groups:
         groups[key].sort(key=lambda f: get_time_from_name(f.name))
 
-    # --- FIX: sort groups by full datetime, not just time-of-day ---
+    # Sort days
     def parse_timestamp_key(key):
-        return datetime.strptime(key, "%Y-%m-%d-%H-%M-%S")
+        return datetime.strptime(key, "%Y-%m-%d")
 
     sorted_group_keys = sorted(groups.keys(), key=parse_timestamp_key)
 
+    print(f"📅 Days detected: {sorted_group_keys}")
 
-    # --- Chapter durations + total duration (for music selection) ---
-    chapter_durations = []
-    total_duration_sec = 0
-    for key in sorted_group_keys:
-        total = 0
-        for f in groups[key]:
-            d = get_duration_seconds(f)
-            total += d
-        chapter_durations.append((key, total))
-        total_duration_sec += total
-
-    print(f"Duration of combined video (from chunks): {total_duration_sec/60:.1f} mins")
-
-    # --- Build concat list file (same as run_flipme) ---
-    list_file = script_root / "all-files.txt"
-    with open(list_file, "w", encoding="utf-8") as f:
-        for key in sorted_group_keys:
-            for file in groups[key]:
-                f.write(f"file '{file}'\n")
-
-    # --- Naming for final output file ---
-    first_key = sorted_group_keys[0]
-    date = "-".join(first_key.split("-")[0:3])
-    earliest_time = get_time_from_name(groups[first_key][0].name)
-    output_file = script_root / f"combined-{date}-{earliest_time}-music.mp4"
-    if output_file.exists():
-        output_file = get_unique_filename(output_file)
-
-    # --- PLAYLIST SELECTION + AUDIO BUILD ---
+    # --- Preload playlists + cache once ---
     playlists = search_youtube_playlists(API_KEY, SEARCH_TERM)
-    playlist_info = []
     cache = load_cache()
 
-    for pl in playlists:
-        pl_id = pl["id"]["playlistId"]
-        title = pl["snippet"]["title"]
-        duration = get_playlist_duration(API_KEY, pl_id, cache)
-        if total_duration_sec <= duration:
-            diff = abs(duration - total_duration_sec)
-            playlist_info.append({
-                "title": title,
-                "id": pl_id,
-                "duration": duration,
-                "diff": diff,
-                "url": f"https://www.youtube.com/playlist?list={pl_id}"
-            })
-    playlist_info.sort(key=lambda x: x["diff"])
+    # --- Process each day independently ---
+    for day_key in sorted_group_keys:
+        day_files = groups[day_key]
+        print(f"\n📆 Processing day {day_key} with {len(day_files)} file(s):")
+        for f in day_files:
+            print(f"   • {f.name}")
 
-    for i, p in enumerate(playlist_info, start=1):
-        match_pct = (p['duration'] / total_duration_sec) * 100
-        print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
+        # --- Compute total duration for this day ---
+        day_duration_sec = 0
+        per_file_durations = []
+        for f in day_files:
+            d = get_duration_seconds(f)  # ffprobe wrapper should ignore unknown streams
+            per_file_durations.append((f, d))
+            day_duration_sec += d
 
-    default_choice = random.randint(1, len(playlist_info))
-    start_alerts()
-    choice = input_with_timeout(
-        "📝 Enter the number of the playlist you want to download: ",
-        timeout=60, default=default_choice, cast_type=int,
-        require_input=False, retries=0
-    )
-    stop_all_alerts()
-    selected = playlist_info[choice-1]
+        print(f"⏱️ Total duration for {day_key}: {day_duration_sec/60:.1f} mins")
 
-    playlist_clean_name = sanitize_filename(selected["title"])
-    DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
+        if day_duration_sec <= 0:
+            print(f"⚠️ Skipping {day_key}: zero duration.")
+            continue
 
-    entry_urls = get_limited_playlist_entries(
-        API_KEY, selected['url'], total_duration_sec,
-        DOWNLOAD_FOLDER, cache, buffer_sec=30
-    )
-    unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+        # --- Build concat list for THIS day ---
+        list_file = script_root / f"all-files-{day_key}.txt"
+        with open(list_file, "w", encoding="utf-8") as f:
+            for file in day_files:
+                f.write(f"file '{file}'\n")
+        print(f"📝 Concat list created: {list_file.name}")
 
-    total_audio = ensure_audio_matches_video(
-        None,
-        DOWNLOAD_FOLDER,
-        API_KEY, selected['url'], cache, buffer_sec=30
-    )
+        # --- PLAYLIST SELECTION FOR THIS DAY ---
+        print(f"🔎 Finding playlists matching ~{day_duration_sec/60:.1f} mins for {day_key}...")
+        playlist_info = []
 
-    output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
-    delete_if_exists(output_mp3)
-    merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
+        for pl in playlists:
+            pl_id = pl["id"]["playlistId"]
+            title = pl["snippet"]["title"]
+            duration = get_playlist_duration(API_KEY, pl_id, cache)
+            if day_duration_sec <= duration:
+                diff = abs(duration - day_duration_sec)
+                playlist_info.append({
+                    "title": title,
+                    "id": pl_id,
+                    "duration": duration,
+                    "diff": diff,
+                    "url": f"https://www.youtube.com/playlist?list={pl_id}"
+                })
 
-    # --- ONE-PASS MERGE + MUSIC USING STDOUT → STDIN STREAMING ---
-    print(f"🎬 Merging chunks and adding music in one pass → {output_file.name}")
+        if not playlist_info:
+            print(f"❌ No suitable playlists found for {day_key}. Skipping this day.")
+            delete_if_exists(list_file)
+            continue
 
-    # Build filter_complex like mix_audio_with_video, but using total_duration_sec
-    duration = total_duration_sec
-    first_video = str(groups[first_key][0])
-    if has_audio_stream(first_video):
-        filter_complex = (
-            f"[0:a]atrim=duration={duration}[a0];"
-            f"[1:a]atrim=duration={duration}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+        playlist_info.sort(key=lambda x: x["diff"])
+
+        print("🎵 Matching playlists:")
+        for i, p in enumerate(playlist_info, start=1):
+            match_pct = (p['duration'] / day_duration_sec) * 100
+            print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
+
+        default_choice = 1  # best match is first after sorting
+        start_alerts()
+        choice = input_with_timeout(
+            f"📝 [{day_key}] Enter the number of the playlist you want to download "
+            f"(default={default_choice}): ",
+            timeout=60, default=default_choice, cast_type=int,
+            require_input=False, retries=0
         )
-    else:
-        filter_complex = (
-            f"anullsrc=channel_layout=stereo:sample_rate=44100[a0];"
-            f"[1:a]atrim=duration={duration}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+        stop_all_alerts()
+
+        if choice is None or choice < 1 or choice > len(playlist_info):
+            print(f"⚠️ Invalid or no choice for {day_key}, using default #{default_choice}.")
+            choice = default_choice
+
+        selected = playlist_info[choice - 1]
+        print(f"✅ Selected playlist for {day_key}: {selected['title']} ({selected['url']})")
+
+        playlist_clean_name = sanitize_filename(selected["title"])
+        DOWNLOAD_FOLDER = os.path.join(MUSIC_FOLDER, playlist_clean_name)
+
+        # --- Download enough audio for THIS day ---
+        print(f"⬇️ Downloading audio for {day_key} into {DOWNLOAD_FOLDER}...")
+        entry_urls = get_limited_playlist_entries(
+            API_KEY, selected['url'], day_duration_sec,
+            DOWNLOAD_FOLDER, cache, buffer_sec=300
+        )
+        unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
+
+        total_audio = ensure_audio_matches_video(
+            None,
+            DOWNLOAD_FOLDER,
+            API_KEY, selected['url'], cache, buffer_sec=300
+        )
+        print(f"🎧 Total audio duration available: {total_audio/60:.1f} mins")
+
+        output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
+        delete_if_exists(output_mp3)
+        merge_mp3s_and_cleanup(DOWNLOAD_FOLDER, output_mp3)
+        print(f"🎼 Combined audio created: {output_mp3}")
+
+        # --- Output filename for THIS day (date + hex suffix) ---
+        hex_suffix = _random_hex_suffix(4)
+        output_file = script_root / f"combined-{day_key}-music-{hex_suffix}.mp4"
+        while output_file.exists():
+            hex_suffix = _random_hex_suffix(4)
+            output_file = script_root / f"combined-{day_key}-music-{hex_suffix}.mp4"
+
+        print(f"🎬 Merging chunks and adding music for {day_key} → {output_file.name}")
+
+        # --- Build filter_complex for THIS day ---
+        duration = day_duration_sec
+        first_video = str(day_files[0])
+        if has_audio_stream(first_video):
+            filter_complex = (
+                f"[0:a]atrim=duration={duration}[a0];"
+                f"[1:a]atrim=duration={duration}[a1];"
+                f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+            )
+        else:
+            filter_complex = (
+                f"anullsrc=channel_layout=stereo:sample_rate=44100[a0];"
+                f"[1:a]atrim=duration={duration}[a1];"
+                f"[a0][a1]amix=inputs=2:duration=shortest:dropout_transition=2[aout]"
+            )
+
+        # FFmpeg #1: concat GoPro chunks → stdout (MPEG-TS stream)
+        merge_proc = subprocess.Popen(
+            [
+                FFMPEG_PATH, "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-c", "copy",
+                "-f", "mpegts",
+                "pipe:1"
+            ],
+            stdout=subprocess.PIPE
         )
 
-    # FFmpeg #1: concat GoPro chunks → stdout (MPEG-TS stream)
-    merge_proc = subprocess.Popen(
-        [
-            FFMPEG_PATH, "-f", "concat", "-safe", "0",
-            "-i", str(list_file),
-            "-c", "copy",
-            "-f", "mpegts",
-            "pipe:1"
-        ],
-        stdout=subprocess.PIPE
-    )
+        # FFmpeg #2: read MPEG-TS from stdin, mix audio, write final MP4 (Option C)
+        mix_proc = subprocess.run(
+            [
+                FFMPEG_PATH, "-y",
+                "-f", "mpegts",
+                "-i", "pipe:0",
+                "-i", output_mp3,
+                "-filter_complex", filter_complex,
+                "-map", "0:v",
+                "-map", "[aout]",
+                "-metadata:s:v", "rotate=180",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                str(output_file)
+            ],
+            stdin=merge_proc.stdout,
+            check=True
+        )
 
-    # FFmpeg #2: read MPEG-TS from stdin, mix audio, write final MP4 (Option C)
-    mix_proc = subprocess.run(
-        [
-            FFMPEG_PATH, "-y",
-            "-f", "mpegts",
-            "-i", "pipe:0",
-            "-i", output_mp3,
-            "-filter_complex", filter_complex,
-            "-map", "0:v",
-            "-map", "[aout]",
-            "-metadata:s:v", "rotate=180",
-            "-c:v", "copy",
-            "-c:a", "aac",
-            str(output_file)
-        ],
-        stdin=merge_proc.stdout,
-        check=True
-    )
+        '''# --- FFmpeg #2: NVENC best-balance encode + 180° rotation + audio mix ---
+        try:
+            subprocess.run(
+                [
+                    FFMPEG_PATH, "-y",
+                    "-f", "mpegts",
+                    "-i", "pipe:0",
+                    "-i", output_mp3,
 
-    merge_proc.wait()
-    delete_if_exists(list_file)
+                    # Video rotation (180°) + audio mix
+                    "-filter_complex", f"[0:v]transpose=2,transpose=2[vout];{filter_complex}",
+                    "-map", "[vout]",
+                    "-map", "[aout]",
 
-    if output_file.exists() and output_file.stat().st_size > 0:
-        # --- Build chapter text for the final file ---
+                    # NVENC best-balance settings
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p4",          # Balanced speed/quality
+                    "-rc", "vbr",             # Adaptive bitrate
+                    "-cq", "19",              # Constant quality target (CRF-like)
+                    "-b:v", "0",              # Let CQ drive bitrate
+                    "-maxrate", "40M",        # Prevent bitrate spikes
+                    "-bufsize", "80M",        # Smooth rate control
+                    "-profile:v", "high",     # Best compatibility
+                    "-pix_fmt", "yuv420p",    # Required for YouTube/VLC
+
+                    # Audio
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+
+                    str(output_file)
+                ],
+                stdin=merge_proc.stdout,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"❌ FFmpeg merge failed for {day_key}: {e}")
+            merge_proc.wait()
+            delete_if_exists(list_file)
+            continue'''
+
+        merge_proc.wait()
+        delete_if_exists(list_file)
+
+        if not (output_file.exists() and output_file.stat().st_size > 0):
+            print(f"❌ Merge + music failed or output file missing for {day_key}.")
+            continue
+
+        # --- Build chapter text for THIS day's file ---
+        # Use per-file chapters with file name as key
+        chapter_durations = [
+            (f.name, dur) for f, dur in per_file_durations
+        ]
         chapter_text = build_youtube_chapters(chapter_durations)
 
-        # --- Save unified metadata JSON (playlist + chapters + video info) ---
+        # --- Save metadata JSON for THIS day ---
         meta = {
             "playlist": {
                 "title": selected["title"],
                 "url": selected["url"],
                 "duration_sec": selected["duration"],
                 "duration_min": round(selected["duration"] / 60, 2),
-                "match_percent": round((selected["duration"] / total_duration_sec) * 100, 2)
+                "match_percent": round((selected["duration"] / day_duration_sec) * 100, 2)
             },
             "video": {
                 "output_file": str(output_file),
-                "total_duration_sec": total_duration_sec,
-                "total_duration_min": round(total_duration_sec / 60, 2)
+                "total_duration_sec": day_duration_sec,
+                "total_duration_min": round(day_duration_sec / 60, 2),
+                "day": day_key
             },
             "chapters": [
-                {"key": key, "duration_sec": dur, "duration_min": round(dur / 60, 2)}
-                for key, dur in chapter_durations
+                {
+                    "file": f.name,
+                    "duration_sec": dur,
+                    "duration_min": round(dur / 60, 2)
+                }
+                for f, dur in per_file_durations
             ],
             "chapter_text": chapter_text
         }
@@ -403,130 +492,42 @@ def process_gopro_with_music_in_one_pass():
         meta_file = Path(str(output_file) + ".meta.json")
         with open(meta_file, "w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=4)
-        print(f"🗂️ Saved metadata JSON to: {meta_file.name}")
+        print(f"🗂️ Saved metadata JSON for {day_key} to: {meta_file.name}")
 
-        # --- Cleanup original GoPro chunks ---
-        print("🧹 Cleaning up original GoPro files...")
-        for key in sorted_group_keys:
-            for file in groups[key]:
-                delete_if_exists(file)
-        print("🧼 All original chunks deleted (one-pass mode).")
+        # --- Cleanup original GoPro chunks for THIS day ---
+        print(f"🧹 Cleaning up original GoPro files for {day_key}...")
+        for file in day_files:
+            delete_if_exists(file)
+        print(f"🧼 All original chunks deleted for {day_key}.")
 
-        save_cache(cache)
-        print(f"🎉 Final merged file with music ready: {output_file.name}")
+        print(f"🎉 Final merged file with music ready for {day_key}: {output_file.name}")
 
-        final_output = str(output_file)
-        playlist_title = selected["title"]
-        playlist_url = selected["url"]
-
-        # --- NEW: upload from inside one-pass ---
+        # --- Upload per day ---
         start_alerts()
         choice = input_with_timeout(
-            "📝 Upload the new music video now? (y/n): ",
+            f"📝 Upload the new music video for {day_key} now? (y/n): ",
             timeout=30,
             require_input=False,
             default="y"
         )
         stop_all_alerts()
 
-        if choice.lower() == "y":
+        if choice and choice.lower() == "y":
             upload_video(
-                final_output,
-                playlist_title,
-                playlist_url,
+                str(output_file),
+                selected["title"],
+                selected["url"],
                 chapter_text,
                 privacy_status="unlisted"
             )
-
             # Cleanup final outputs after successful upload
-            cleanup_final_outputs(final_output, meta_file)
+            cleanup_final_outputs(str(output_file), meta_file)
+        else:
+            print(f"⏭️ Skipping upload for {day_key}. Files kept: {output_file.name}, {meta_file.name}")
 
-        return final_output, chapter_text, playlist_title, playlist_url
-
-    print("❌ One-pass merge + music failed or output file missing.")
-    return None, None, None, None
-
-'''
-def run_flipme():
-    script_root = Path(VIDEO_FOLDER)
-
-    all_files = list(script_root.glob("*.mp4"))
-    mp4_files = [
-        f for f in all_files
-        if is_valid_mp4(f)
-        and "combined-" not in f.name.lower()
-        and "-music" not in f.name.lower()
-        and "flipped" not in f.name.lower()
-    ]
-
-    print(f"✅ Valid MP4 files: {[f.name for f in mp4_files]}")
-    if not mp4_files:
-        return None, None
-
-    groups = {}
-    for file in mp4_files:
-        key = extract_timestamp_key(file.name)
-        groups.setdefault(key, []).append(file)
-
-    for key in groups:
-        groups[key].sort(key=lambda f: get_time_from_name(f.name))
-
-    sorted_group_keys = sorted(
-        groups.keys(),
-        key=lambda k: get_time_from_name(groups[k][0].name)
-    )
-
-    chapter_durations = []
-    for key in sorted_group_keys:
-        total = 0
-        for f in groups[key]:
-            total += get_duration_seconds(f)
-        chapter_durations.append((key, total))
-
-    list_file = script_root / "all-files.txt"
-    with open(list_file, "w", encoding="utf-8") as f:
-        for key in sorted_group_keys:
-            for file in groups[key]:
-                f.write(f"file '{file}'\n")
-
-    first_key = sorted_group_keys[0]
-    date = "-".join(first_key.split("-")[0:3])
-    earliest_time = get_time_from_name(groups[first_key][0].name)
-
-    output_file = script_root / f"combined-{date}-{earliest_time}.mp4"
-    if output_file.exists():
-        output_file = get_unique_filename(output_file)
-
-    print(f"🎬 Merging into: {output_file.name}")
-    subprocess.run([
-        FFMPEG_PATH, "-f", "concat", "-safe", "0",
-        "-i", str(list_file), "-c", "copy", str(output_file)
-    ])
-
-    delete_if_exists(list_file)
-
-    if output_file.exists() and output_file.stat().st_size > 0:
-        chapter_text = build_youtube_chapters(chapter_durations)
-
-        chapter_file = Path(str(output_file) + ".chapters.txt")
-        with open(chapter_file, "w", encoding="utf-8") as cf:
-            cf.write(chapter_text)
-
-        print(f"📄 Saved chapter text to: {chapter_file.name}")
-
-        print("🧹 Cleaning up original GoPro files...")
-        for key in sorted_group_keys:
-            for file in groups[key]:
-                delete_if_exists(file)
-
-        print(f"🎉 Final merged file ready: {output_file.name}")
-        print("🧼 All original chunks deleted (production mode).")
-
-        return str(output_file), chapter_text
-
-    print("❌ Merge failed or output file missing.")
-    return None, None
-'''
+    # --- Save cache once after all days processed ---
+    save_cache(cache)
+    print("✅ All days processed.")
 
 def format_ts(sec):
     h = sec // 3600
@@ -623,6 +624,7 @@ def get_video_duration(video_file):
     # Try stream-level duration (more precise)
     stream_args = [
         "ffprobe", "-v", "error",
+        "-ignore_unknown",
         "-select_streams", "v:0",
         "-show_entries", "stream=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
@@ -634,6 +636,7 @@ def get_video_duration(video_file):
     if duration is None or duration < 1:
         format_args = [
             "ffprobe", "-v", "error",
+            "-ignore_unknown",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             video_file
@@ -721,90 +724,77 @@ def fetch_video_durations(video_ids, api_key, cache=None):
     return durations
 
 
-def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, download_folder, cache=None, buffer_sec=30):
-    cumulative_duration = 0
-    selected_entries = []
-    target_duration = max_duration_sec + buffer_sec
+def get_limited_playlist_entries(api_key, playlist_url, max_duration_sec, download_folder, cache=None, buffer_sec=300):
+    """
+    Download tracks one-by-one and measure REAL durations.
+    Stop only when REAL total >= max_duration_sec + buffer_sec.
+    """
+    import subprocess
+
+    def real_duration(path):
+        """Return actual audio duration in seconds using ffprobe."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ]
+        try:
+            out = subprocess.check_output(cmd).decode().strip()
+            return float(out)
+        except Exception:
+            return 0.0
 
     os.makedirs(download_folder, exist_ok=True)
+
+    target_duration = max_duration_sec + buffer_sec
+    total_real = 0
+    selected_entries = []
 
     print(f"Fetching flat playlist entries from: {playlist_url}")
     ydl_opts = {
         'quiet': True,
         'extract_flat': True,
         'skip_download': True,
-        "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
+        "extractor_args": {"youtube": {"player_client": ["default", "-tv_simply"], "player_js_version": "actual"}},
     }
 
+    # Fetch playlist entries
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
         entries = info.get('entries', [])
         random.shuffle(entries)
         print(f"Found {len(entries)} flat entries")
 
-    video_ids = [e.get('id') for e in entries if e.get('id')]
-    uncached_ids = [vid for vid in video_ids if not cache or vid not in cache]
-
-    # Fetch durations via YouTube API
-    if uncached_ids:
-        url = "https://www.googleapis.com/youtube/v3/videos"
-        for i in range(0, len(uncached_ids), 50):
-            batch_ids = uncached_ids[i:i+50]
-            params = {
-                "part": "contentDetails",
-                "id": ",".join(batch_ids),
-                "key": api_key
-            }
-            resp = requests.get(url, params=params)
-            resp.raise_for_status()
-            for item in resp.json().get("items", []):
-                vid = item["id"]
-                dur = iso8601_duration_to_seconds(item["contentDetails"]["duration"])
-                if cache is not None:
-                    cache[vid] = dur
-
-    # Select entries and download into download_folder
+    # Download + measure REAL durations
     for entry in entries:
-        vid = entry.get('id')
         url = entry.get('url')
         title = entry.get('title', 'unknown')
-        duration = cache.get(vid, 0)
 
-        if not url or duration == 0:
-            print(f"⚠️ Skipping {title} (missing URL or duration)")
+        if not url:
+            print(f"⚠️ Skipping {title} (missing URL)")
             continue
 
         filename = sanitize_filename(f"{title}.mp3")
         full_path = os.path.join(download_folder, filename)
-        ''''
-        if os.path.exists(full_path):
-            print(f"✅ Already downloaded: {full_path}")
-        else:
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': full_path,
-                'quiet': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                "extractor_args": {"youtube":{"player_client":["default","-tv_simply"],"player_js_version": "actual"}},
-            }
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                print(f"⬇️ Downloaded: {full_path}")
-            except Exception as e:
-                print(f"❌ Failed to download {title}: {e}")
-                continue
-        '''
-        cumulative_duration += duration
-        selected_entries.append(url)
-        print(f"✓ {title} — {duration:.1f}s → Total: {cumulative_duration:.1f}s")
 
-        if cumulative_duration > target_duration:
-            print(f"✅ Target exceeded: {cumulative_duration:.1f}s > {target_duration:.1f}s")
+        # Download immediately
+        unified_download_playlist([url], download_folder, max_workers=1)
+
+        # Measure REAL duration
+        real = real_duration(full_path)
+
+        if real < 5:
+            print(f"⚠️ Skipping broken/short file: {title} ({real:.1f}s)")
+            delete_if_exists(full_path)
+            continue
+
+        selected_entries.append(url)
+        total_real += real
+        print(f"✓ {title} — REAL {real:.1f}s → Total REAL: {total_real:.1f}s")
+
+        if total_real >= target_duration:
+            print(f"✅ REAL target met: {total_real:.1f}s ≥ {target_duration:.1f}s")
             break
 
     return selected_entries
@@ -948,25 +938,41 @@ def get_total_audio_duration(file_list, workers=8):
     print(f"🎯 Total audio duration: {total/60:.2f} minutes")
     return total
 
-def ensure_audio_matches_video(video_file, mp3_folder, api_key, playlist_url, cache, buffer_sec=30):
+def ensure_audio_matches_video(video_file, mp3_folder, api_key, playlist_url, cache, buffer_sec=300):
     """
-    Ensure audio duration >= video duration.
+    Ensure REAL audio duration >= REAL video duration.
     If short, download more tracks until target is met.
     """
     video_duration = fast_audio_duration(video_file)
-    mp3_files = [str(Path(mp3_folder) / f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+
+    # Get REAL total audio duration
+    mp3_files = [
+        str(Path(mp3_folder) / f)
+        for f in os.listdir(mp3_folder)
+        if f.lower().endswith('.mp3')
+    ]
     total_audio = get_total_audio_duration(mp3_files)
 
-    if total_audio + buffer_sec < video_duration:
-        print(f"⚠️ Audio too short ({total_audio:.1f}s vs video {video_duration:.1f}s). Fetching more tracks...")
-        # Call get_limited_playlist_entries again to top up
-        extra_urls = get_limited_playlist_entries(api_key, playlist_url,
-                                                  video_duration - total_audio,
-                                                  mp3_folder, cache, buffer_sec=buffer_sec)
-        #download_playlist_parallel(extra_urls, mp3_folder, max_workers=8)
-        unified_download_playlist(extra_urls, mp3_folder, max_workers=8)
-        # Recalculate after top‑up
-        mp3_files = [str(Path(mp3_folder) / f) for f in os.listdir(mp3_folder) if f.lower().endswith('.mp3')]
+    # Keep topping up until REAL duration is enough
+    while total_audio + buffer_sec < video_duration:
+        missing = video_duration - total_audio
+        print(f"⚠️ Audio too short ({total_audio:.1f}s vs video {video_duration:.1f}s). Need +{missing:.1f}s")
+
+        extra_urls = get_limited_playlist_entries(
+            api_key, playlist_url,
+            missing,
+            mp3_folder, cache,
+            buffer_sec=buffer_sec
+        )
+
+        # Already downloaded inside get_limited_playlist_entries()
+
+        # Recalculate REAL duration
+        mp3_files = [
+            str(Path(mp3_folder) / f)
+            for f in os.listdir(mp3_folder)
+            if f.lower().endswith('.mp3')
+        ]
         total_audio = get_total_audio_duration(mp3_files)
 
     return total_audio
@@ -1089,13 +1095,13 @@ def run_add_music(video_file):
 
     entry_urls = get_limited_playlist_entries(
         API_KEY, selected['url'], duration_sec,
-        DOWNLOAD_FOLDER, cache, buffer_sec=30
+        DOWNLOAD_FOLDER, cache, buffer_sec=300
     )
     unified_download_playlist(entry_urls, DOWNLOAD_FOLDER, max_workers=8)
 
     total_audio = ensure_audio_matches_video(
         video_file, DOWNLOAD_FOLDER,
-        API_KEY, selected['url'], cache, buffer_sec=30
+        API_KEY, selected['url'], cache, buffer_sec=300
     )
 
     output_mp3 = os.path.join(DOWNLOAD_FOLDER, "combined_playlist.mp3")
@@ -1114,58 +1120,95 @@ def run_add_music(video_file):
 # =========================
 # STEP 3: UPLOAD FUNCTIONS
 # =========================
-def print_progress(status, start_time, last_bytes=[0], last_time=[None]):
-    uploaded = status.resumable_progress
-    total = status.total_size
+class ProgressFile:
+    def __init__(self, file_path, progress_state):
+        self.f = open(file_path, "rb")
+        self.progress_state = progress_state
 
-    if not total:
-        return  # avoid division by zero
+    def read(self, size=-1):
+        chunk = self.f.read(size)
+        self.progress_state["uploaded"] += len(chunk)
+        #print("READ:", len(chunk))
+        return chunk
 
-    progress = uploaded / total
+    def seek(self, offset, whence=0):
+        return self.f.seek(offset, whence)
 
-    # Progress bar
-    bar_len = 30
-    filled = int(bar_len * progress)
-    bar = "█" * filled + "░" * (bar_len - filled)
+    def tell(self):
+        return self.f.tell()
 
-    # Timing
-    now = time.time()
-    elapsed = now - start_time
+    def close(self):
+        return self.f.close()
 
-    # Instant speed
-    if last_time[0] is None:
-        inst_speed = 0
-    else:
-        dt = now - last_time[0]
-        db = uploaded - last_bytes[0]
-        inst_speed = db / dt if dt > 0 else 0
+_last_len = 0
 
-    # Average speed
-    avg_speed = uploaded / elapsed if elapsed > 0 else 0
+def safe_print_line(text):
+    import sys
+    global _last_len
 
-    # ETA
-    remaining = total - uploaded
-    eta = remaining / avg_speed if avg_speed > 0 else 0
+    # Overwrite previous line fully
+    sys.stdout.write("\r" + text)
 
-    # Update rolling state
-    last_bytes[0] = uploaded
-    last_time[0] = now
+    # If new text is shorter, overwrite leftovers
+    if len(text) < _last_len:
+        sys.stdout.write(" " * (_last_len - len(text)) + "\r" + text)
+
+    sys.stdout.flush()
+    _last_len = len(text)
+
+def start_real_timer_thread(stop_event, progress_state):
+    def fmt_time(t):
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
 
     def fmt_bytes(b):
-        for unit in ["B","KB","MB","GB"]:
+        for unit in ["B","KB","MB","GB","TB"]:
             if b < 1024:
                 return f"{b:.1f}{unit}"
             b /= 1024
-        return f"{b:.1f}TB"
+        return f"{b:.1f}PB"
 
-    sys.stdout.write(
-        f"\rUploading: [{bar}] {progress*100:5.1f}%  "
-        f"{fmt_bytes(uploaded)}/{fmt_bytes(total)}  "
-        f"⚡ {inst_speed/1024/1024:4.2f} MB/s inst  "
-        f"📈 {avg_speed/1024/1024:4.2f} MB/s avg  "
-        f"ETA {time.strftime('%M:%S', time.gmtime(eta))}"
-    )
-    sys.stdout.flush()
+    while not stop_event.is_set():
+        now = time.time()
+        uploaded = progress_state["uploaded"]
+        total = progress_state["total"]
+
+        dt = now - progress_state["last_time"]
+        db = uploaded - progress_state["last_uploaded"]
+        inst_speed = db / dt if dt > 0 else 0
+
+        elapsed = now - progress_state["start_time"]
+        avg_speed = uploaded / elapsed if elapsed > 0 else 0
+
+        remaining = total - uploaded
+        eta = remaining / avg_speed if avg_speed > 0 else 0
+
+        progress = uploaded / total if total > 0 else 0
+        bar_len = 30
+        filled = int(bar_len * progress)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        line = (
+            f"[{bar}] {progress*100:5.1f}%  "
+            f"{fmt_bytes(uploaded)}/{fmt_bytes(total)}  "
+            f"⚡ {inst_speed/1024/1024:4.2f} MB/s inst  "
+            f"📈 {avg_speed/1024/1024:4.2f} MB/s avg  "
+            f"ETA {fmt_time(eta)}"
+        )
+
+        safe_print_line(line)
+
+        progress_state["last_uploaded"] = uploaded
+        progress_state["last_time"] = now
+
+        time.sleep(1)
+
+    # ❌ REMOVE THIS — it prints the blank padded line
+    # safe_print_line("")
 
 def get_authenticated_service():
     creds = None
@@ -1232,99 +1275,102 @@ def get_authenticated_service():
 
     return build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, http=authed_http)
 
-def start_timer_thread(stop_event, total_bytes, assumed_speed_bps=100*1024*1024):
-    start = time.time()
-
-    def fmt_time(t):
-        return time.strftime("%M:%S", time.gmtime(t))
-
-    def fmt_bytes(b):
-        for unit in ["B","KB","MB","GB"]:
-            if b < 1024:
-                return f"{b:.1f}{unit}"
-            b /= 1024
-        return f"{b:.1f}TB"
-    while not stop_event.is_set():
-        elapsed = time.time() - start
-        uploaded_est = min(elapsed * assumed_speed_bps, total_bytes)
-        progress = uploaded_est / total_bytes
-        remaining = total_bytes - uploaded_est
-        eta = remaining / assumed_speed_bps if assumed_speed_bps > 0 else 0
-        bar_len = 30
-        filled = int(bar_len * progress)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        sys.stdout.write(
-            f"\r[{bar}] {progress*100:5.1f}%  "
-            f"{fmt_bytes(uploaded_est)}/{fmt_bytes(total_bytes)}  "
-            f"⏱ {fmt_time(elapsed)}  ETA {fmt_time(eta)}"
-        )
-        sys.stdout.flush()
-        time.sleep(1)
-
-    # Clear the line when done
-    sys.stdout.write("\r" + " " * 120 + "\r")
-    sys.stdout.flush()
-
 def resumable_upload(insert_request, file_size):
     response, error, retry = None, None, 0
     start_time = time.time()
-    stop_event = threading.Event()
-    threading.Thread(
-        target=start_timer_thread,
-        args=(stop_event, file_size),
-        daemon=True
-    ).start()
-    while response is None:
-        try:
 
-            status, response = insert_request.next_chunk()
-            if response and "id" in response:
-                total_time = time.time() - start_time
-                stop_event.set()
-                video_url = f"https://youtu.be/{response['id']}"
-                # Fetch latest Strava activity ID
-                strava_activity_id = get_latest_strava_activity()
-                strava_url = f"https://www.strava.com/activities/{strava_activity_id}" if strava_activity_id else ""
-                if strava_activity_id and video_url:
-                    webhook_url = f"https://dylix.org/stravaWebhook?youtube&activityid={strava_activity_id}&url={video_url}"
-                    resp = requests.get(webhook_url)
-                    print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
-                print(f"✅ Uploaded: {video_url}")
-                # Convert total_time into h/m/s
-                seconds = int(total_time)
-                mins, secs = divmod(seconds, 60)
-                hours, mins = divmod(mins, 60)
+    # --- REUSE TIMER + PROGRESS STATE CREATED IN initialize_upload() ---
+    stop_event = insert_request.stop_event
+    timer_thread = insert_request.timer_thread
+    progress_state = insert_request.progress_state
 
-                if hours > 0:
-                    readable = f"{hours}h {mins}m {secs}s"
-                elif mins > 0:
-                    readable = f"{mins}m {secs}s"
+    try:
+        while response is None:
+            try:
+                status, response = insert_request.next_chunk()
+
+                # ProgressFile updates progress_state["uploaded"] automatically
+
+                if response and "id" in response:
+                    # Upload finished
+                    stop_event.set()
+                    timer_thread.join()
+
+                    total_time = time.time() - start_time
+                    video_url = f"https://youtu.be/{response['id']}"
+
+                    # Strava webhook
+                    strava_activity_id = get_latest_strava_activity()
+                    strava_url = (
+                        f"https://www.strava.com/activities/{strava_activity_id}"
+                        if strava_activity_id else ""
+                    )
+                    if strava_activity_id and video_url:
+                        webhook_url = (
+                            f"https://dylix.org/stravaWebhook?youtube"
+                            f"&activityid={strava_activity_id}&url={video_url}"
+                        )
+                        resp = requests.get(webhook_url)
+                        print(f"📡 Webhook called: {webhook_url} (status {resp.status_code})")
+
+                    print(f"✅ Uploaded: {video_url}")
+
+                    # Pretty total time
+                    seconds = int(total_time)
+                    mins, secs = divmod(seconds, 60)
+                    hours, mins = divmod(mins, 60)
+
+                    if hours > 0:
+                        readable = f"{hours}h {mins}m {secs}s"
+                    elif mins > 0:
+                        readable = f"{mins}m {secs}s"
+                    else:
+                        readable = f"{secs}s"
+
+                    print(f"⏱️ Total time: {readable}")
+
+                    try:
+                        pyperclip.copy(video_url)
+                    except Exception:
+                        print("Clipboard copy not available.")
+
+                    return video_url
+
+            except HttpError as e:
+                if e.resp.status in [500, 502, 503, 504]:
+                    error = f"Retriable HTTP error {e.resp.status}"
                 else:
-                    readable = f"{secs}s"
+                    raise
 
-                print(f"⏱️ Total time: {readable}")
+            except Exception as e:
+                error = f"Retriable error: {e}"
 
-                try:
-                    pyperclip.copy(video_url)
-                except Exception:
-                    print("Clipboard copy not available.")
-                return video_url   # <-- return URL here
-        except HttpError as e:
-            if e.resp.status in [500,502,503,504]:
-                error = f"Retriable HTTP error {e.resp.status}"
-            else:
-                raise
-        except Exception as e:
-            error = f"Retriable error: {e}"
-        if error:
-            retry += 1
-            if retry > 10:
-                raise RuntimeError("Upload failed after max retries.")
-            sleep_seconds = random.random() * (2**retry)
-            print(f"{error}, sleeping {sleep_seconds:.1f}s...")
-            time.sleep(sleep_seconds)
+            if error:
+                retry += 1
+                if retry > 10:
+                    raise RuntimeError("Upload failed after max retries.")
+                sleep_seconds = random.random() * (2 ** retry)
+                print(f"{error}, sleeping {sleep_seconds:.1f}s...")
+                time.sleep(sleep_seconds)
+                error = None
+
+    finally:
+        # --- ALWAYS CLEAN UP TIMER THREAD ---
+        stop_event.set()
+        try:
+            timer_thread.join(timeout=1)
+        except Exception:
+            pass
 
 def initialize_upload(youtube, options):
+    # --- KILL ANY PREVIOUS TIMER THREAD (THE REAL FIX) ---
+    if hasattr(youtube, "active_stop_event"):
+        try:
+            youtube.active_stop_event.set()
+            youtube.active_timer_thread.join(timeout=1)
+        except Exception:
+            pass
+
     body = dict(
         snippet=dict(
             title=options.title,
@@ -1336,13 +1382,60 @@ def initialize_upload(youtube, options):
             selfDeclaredMadeForKids=False
         )
     )
+
     file_size = os.path.getsize(options.file)
+
+    # --- REAL PROGRESS STATE ---
+    progress_state = {
+        "uploaded": 0,
+        "total": file_size,
+        "last_uploaded": 0,
+        "last_time": time.time(),
+        "start_time": time.time()
+    }
+
+    # --- WRAP THE FILE ---
+    wrapped_file = ProgressFile(options.file, progress_state)
+
+    # --- USE MediaIoBaseUpload ---
+    media_body = MediaIoBaseUpload(
+        wrapped_file,
+        mimetype="video/mp4",
+        chunksize=-1,
+        resumable=True
+    )
+
     insert_request = youtube.videos().insert(
         part=",".join(body.keys()),
         body=body,
-        media_body=MediaFileUpload(options.file, chunksize=-1, resumable=True)
+        media_body=media_body
     )
+
+    # --- START REAL TIMER THREAD (ONLY ONE ALLOWED) ---
+    stop_event = threading.Event()
+    timer_thread = threading.Thread(
+        target=start_real_timer_thread,
+        args=(stop_event, progress_state),
+        daemon=True
+    )
+    timer_thread.start()
+
+    # --- STORE ACTIVE TIMER FOR NEXT RUN ---
+    youtube.active_stop_event = stop_event
+    youtube.active_timer_thread = timer_thread
+
+    # --- ATTACH TIMER + STATE TO REQUEST ---
+    insert_request.stop_event = stop_event
+    insert_request.timer_thread = timer_thread
+    insert_request.progress_state = progress_state
+
+    # --- RUN UPLOAD ---
     resumable_upload(insert_request, file_size)
+
+    # --- CLEANUP ---
+    stop_event.set()
+    timer_thread.join()
+    wrapped_file.close()
 
 def format_time(seconds):
     """Convert seconds into H:MM:SS format."""
@@ -1490,7 +1583,8 @@ def process_video_file(video_file, meta_json_path):
         print(f"🎵 Skipping {video_file} — music version already exists.")
         return
 
-    playlist_title, final_video, playlist_url = run_add_music(video_file)
+    #playlist_title, final_video, playlist_url = run_add_music(video_file)
+    playlist_title, final_video, playlist_url = load_metadata_and_upload(video_file)
 
     if final_video:
         # STRICT MODE: require meta.json instead of chapters.txt
@@ -2003,12 +2097,7 @@ def flash_window():
 stop_alerts = threading.Event()
 print_lock = threading.Lock()
 
-def safe_print(*args, **kwargs):
-    with print_lock:
-        print(*args, **kwargs)
-
 # --- Timeout Logic ---
-
 def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_input=False, retries=0):
     # ----------------------------------------------------
     # REQUIRED INPUT MODE (pure blocking, no timeout)
@@ -2079,6 +2168,47 @@ def input_with_timeout(prompt, timeout=30, default=None, cast_type=str, require_
                 break
 
             time.sleep(0.05)
+
+def load_metadata_only(video_file):
+    """
+    Loads metadata JSON for an existing merged video WITHOUT uploading.
+    Returns (playlist_title, final_video, playlist_url).
+    """
+    meta_path = Path(str(video_file) + ".meta.json")
+
+    if not meta_path.exists():
+        print(f"⚠️ No metadata file found for {video_file}.")
+        return Path(video_file).stem, str(video_file), ""
+
+    meta = json.loads(meta_path.read_text())
+
+    playlist_title = meta["playlist"]["title"]
+    playlist_url = meta["playlist"]["url"]
+    final_video = str(video_file)
+
+    return playlist_title, final_video, playlist_url
+
+def load_metadata_and_upload(final_video):
+    meta_file = Path(str(final_video) + ".meta.json")
+    if not meta_file.exists():
+        raise FileNotFoundError(f"No metadata file found for {final_video}")
+
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    playlist_title = meta["playlist"]["title"]
+    playlist_url = meta["playlist"]["url"]
+    chapter_text = meta["chapter_text"]
+
+    upload_video(
+        str(final_video),
+        playlist_title,
+        playlist_url,
+        chapter_text,
+        privacy_status="unlisted"
+    )
+
+    return playlist_title, str(final_video), playlist_url
 
 # --- Optional Popup (cross-platform) ---
 def show_popup():
@@ -2247,7 +2377,11 @@ if __name__ == "__main__":
             playlist_url = ""
 
     else:
-        playlist_title, final_video, playlist_url = run_add_music(video_file)
+        #playlist_title, final_video, playlist_url = run_add_music(video_file)
+        #playlist_title, final_video, playlist_url = load_metadata_and_upload(video_file)
+        playlist_title, final_video, playlist_url = load_metadata_only(video_file)
+        final_video = final_video or video_file
+
 
     if final_video:
         start_alerts()
