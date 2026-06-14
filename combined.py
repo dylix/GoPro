@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
     "WATCH_EXTENSIONS": [".mp4"],
     "SETTLE_TIME": 300,
     "CHECK_INTERVAL": 10,
-    "SEARCH_TERM": "royalty free edm",
+    "SEARCH_TERM": "EDM No Copyright Music",
     "CONFIRM": True,
     "FLIP_FILES": False,
     "DELETE_ORIGINALS": True,
@@ -409,46 +409,6 @@ def process_gopro_with_music_in_one_pass():
             check=True
         )
 
-        '''# --- FFmpeg #2: NVENC best-balance encode + 180° rotation + audio mix ---
-        try:
-            subprocess.run(
-                [
-                    FFMPEG_PATH, "-y",
-                    "-f", "mpegts",
-                    "-i", "pipe:0",
-                    "-i", output_mp3,
-
-                    # Video rotation (180°) + audio mix
-                    "-filter_complex", f"[0:v]transpose=2,transpose=2[vout];{filter_complex}",
-                    "-map", "[vout]",
-                    "-map", "[aout]",
-
-                    # NVENC best-balance settings
-                    "-c:v", "h264_nvenc",
-                    "-preset", "p4",          # Balanced speed/quality
-                    "-rc", "vbr",             # Adaptive bitrate
-                    "-cq", "19",              # Constant quality target (CRF-like)
-                    "-b:v", "0",              # Let CQ drive bitrate
-                    "-maxrate", "40M",        # Prevent bitrate spikes
-                    "-bufsize", "80M",        # Smooth rate control
-                    "-profile:v", "high",     # Best compatibility
-                    "-pix_fmt", "yuv420p",    # Required for YouTube/VLC
-
-                    # Audio
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-
-                    str(output_file)
-                ],
-                stdin=merge_proc.stdout,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"❌ FFmpeg merge failed for {day_key}: {e}")
-            merge_proc.wait()
-            delete_if_exists(list_file)
-            continue'''
-
         merge_proc.wait()
         delete_if_exists(list_file)
 
@@ -520,10 +480,10 @@ def process_gopro_with_music_in_one_pass():
                 chapter_text,
                 privacy_status="unlisted"
             )
-            # Cleanup final outputs after successful upload
-            cleanup_final_outputs(str(output_file), meta_file)
-        else:
-            print(f"⏭️ Skipping upload for {day_key}. Files kept: {output_file.name}, {meta_file.name}")
+
+        # --- Ask whether to delete originals from SD card ---
+        confirm_and_delete(require_input=True)
+
 
     # --- Save cache once after all days processed ---
     save_cache(cache)
@@ -1837,18 +1797,37 @@ def copy_gopro_files(drive_letter):
     finally:
         is_copying = False
 
-def confirm_and_delete():
+def confirm_and_delete(require_input=False):
     global files_to_delete, drive_letter_global
+
     if not files_to_delete:
         print("ℹ️ No files marked for deletion.")
         return
+
     if not drive_letter_global:
         print("⚠️ No drive letter stored.")
         return
-    #print("DEBUG: files_to_delete =", files_to_delete)
-    start_alerts()
-    choice = input_with_timeout("🗑️ Delete originals from GoPro drive? (y/N): ", timeout=30, require_input=False, default="n").strip().lower()
-    stop_all_alerts()
+
+    # REQUIRED INPUT MODE (pure blocking)
+    if require_input:
+        choice = input_with_timeout(
+            "🗑️ Delete originals from GoPro drive? (y/N): ",
+            timeout=None,
+            require_input=True,
+            default=None
+        ).strip().lower()
+
+    else:
+        # ORIGINAL TIMEOUT MODE
+        start_alerts()
+        choice = input_with_timeout(
+            "🗑️ Delete originals from GoPro drive? (y/N): ",
+            timeout=30,
+            require_input=False,
+            default="n"
+        ).strip().lower()
+        stop_all_alerts()
+
     if choice == "y":
         for f in set(files_to_delete):
             try:
@@ -1856,9 +1835,11 @@ def confirm_and_delete():
                 print(f"   Removed {f}")
             except Exception as e:
                 print(f"⚠️ Could not delete {f}: {e}")
+
         eject_drive(drive_letter_global)
         files_to_delete.clear()
         drive_letter_global = None
+
     else:
         print("ℹ️ Files left on the GoPro drive.")
 
