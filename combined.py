@@ -254,6 +254,8 @@ def process_gopro_with_music_in_one_pass():
     # --- Preload playlists + cache once ---
     playlists = search_youtube_playlists(API_KEY, SEARCH_TERM)
     cache = load_cache()
+    print("DEBUG: Raw playlist search result:")
+    print(playlists)
 
     # --- Process each day independently ---
     for day_key in sorted_group_keys:
@@ -291,6 +293,10 @@ def process_gopro_with_music_in_one_pass():
             pl_id = pl["id"]["playlistId"]
             title = pl["snippet"]["title"]
             duration = get_playlist_duration(API_KEY, pl_id, cache)
+            if duration is None:
+                print(f"⚠️ Skipping playlist {pl_id} — duration unavailable.")
+                continue
+
             if day_duration_sec <= duration:
                 diff = abs(duration - day_duration_sec)
                 playlist_info.append({
@@ -617,41 +623,86 @@ def search_youtube_playlists(api_key, query, max_results=49):
     return resp.json().get("items", [])
 
 def get_playlist_duration(api_key, playlist_id, cache):
-    if playlist_id in cache and "duration" in cache[playlist_id]:
-        return cache[playlist_id]["duration"]
+    # Cache hit
+    if playlist_id in cache:
+        val = cache[playlist_id]
+        if isinstance(val, (int, float)):
+            return val
+        else:
+            print(f"⚠️ Cached value for {playlist_id} was not numeric. Resetting.")
+            del cache[playlist_id]
+
+    url = (
+        "https://www.googleapis.com/youtube/v3/playlistItems"
+        "?part=contentDetails"
+        f"&playlistId={playlist_id}"
+        "&maxResults=50"
+        f"&key={api_key}"
+    )
+
+    total_seconds = 0
+    next_page = None
+    attempts = 0
     video_ids = []
-    page_token = None
+
     while True:
-        url = "https://www.googleapis.com/youtube/v3/playlistItems"
-        params = {
-            "part": "contentDetails",
-            "playlistId": playlist_id,
-            "maxResults": 50,
-            "key": api_key
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        resp = requests.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        video_ids.extend([i["contentDetails"]["videoId"] for i in data.get("items", [])])
-        page_token = data.get("nextPageToken")
-        if not page_token:
+        attempts += 1
+        if attempts > 10:
+            print(f"❌ Timeout reading playlist {playlist_id}, aborting.")
             break
 
-    durations = fetch_video_durations(video_ids, api_key, cache)
-    total_seconds = sum(durations.values())
+        try:
+            resp = requests.get(
+                url + (f"&pageToken={next_page}" if next_page else ""),
+                timeout=10
+            )
+            data = resp.json()
 
-    cache[playlist_id] = {
-        "title": "",  # optional
-        "duration": total_seconds,
-        "cached_at": datetime.now(UTC).isoformat()
-    }
+            # API error
+            if "error" in data:
+                print(f"❌ API error for playlist {playlist_id}: {data['error']}")
+                break
+
+            items = data.get("items", [])
+            if not items:
+                break
+
+            # Collect video IDs
+            for item in items:
+                vid = item["contentDetails"]["videoId"]
+                video_ids.append(vid)
+
+            next_page = data.get("nextPageToken")
+            if not next_page:
+                break
+
+        except Exception as e:
+            print(f"❌ Exception reading playlist {playlist_id}: {e}")
+            break
+
+    # Now fetch durations in batch using your existing helper
+    if video_ids:
+        durations = fetch_video_durations(video_ids, api_key, cache)
+        for vid in video_ids:
+            dur = durations.get(vid, 0)
+            if isinstance(dur, (int, float)):
+                total_seconds += dur
+            else:
+                print(f"⚠️ Non-numeric duration for video {vid}: {dur}")
+
+    if total_seconds == 0:
+        # Timeout or failure — mark as unusable
+        cache[playlist_id] = None
+        return None
+
+    cache[playlist_id] = total_seconds
     return total_seconds
+
 
 def chunkify(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
+
 
 def fetch_video_durations(video_ids, api_key, cache=None):
     durations = {}
@@ -2012,22 +2063,34 @@ def start_watcher_then_process():
             # Only trigger processing if:
             # 1. An event happened
             # 2. We have real pending files
+            # 3. We are not currently copying
             if last_event_time and pending_files and not is_copying:
                 wait_for_settle()
+
                 # Re-validate pending files before processing
                 real_files = [f for f in pending_files if is_valid_input_file(f)]
                 pending_files.clear()
+
+                # ⭐ FIX: Only process if real_files is non-empty
                 if real_files:
                     print(f"📦 Processing batch of {len(real_files)} new files...")
-                    final_output, _, _, _ = process_all_new_files()
-                    if drive_letter_global:
-                        # Prevent double delete prompt if the one-pass function already removed the files
-                        if final_output and os.path.exists(final_output):
-                            confirm_and_delete()
-                        else:
-                            print("ℹ️ Final merged MP4 already deleted — skipping delete prompt.")
+
+                    result = process_all_new_files()
+                    if result:
+                        final_output, _, _, _ = result
+
+                        if drive_letter_global:
+                            # Prevent double delete prompt if the one-pass function already removed the files
+                            if final_output and os.path.exists(final_output):
+                                confirm_and_delete()
+                            else:
+                                print("ℹ️ Final merged MP4 already deleted — skipping delete prompt.")
+                    else:
+                        print("ℹ️ No output returned — skipping delete prompt.")
+
                 print("🔁 Returning to watch mode...\n")
                 last_event_time = None
+
             else:
                 time.sleep(0.5)
 
@@ -2037,7 +2100,6 @@ def start_watcher_then_process():
     finally:
         observer.stop()
         observer.join()
-
 
 def has_music_version(file_path):
     base, ext = os.path.splitext(file_path)

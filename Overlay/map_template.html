@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body, #map { height: 100%; margin: 0; padding: 0; }
+</style>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+<!-- Qt WebChannel -->
+<script type="text/javascript" src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+</head>
+
+<body>
+<div id="map"></div>
+
+<script>
+// ------------------------------
+// WebChannel setup
+// ------------------------------
+var py = null;
+console.log("JS: calling window.pyReady()");
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+    py = channel.objects.qt_object;
+    console.log("WebChannel connected");
+});
+
+// Python will inject:
+// window.pyReady = function() { py.mapIsReady(); }
+
+// ------------------------------
+// Leaflet map setup
+// ------------------------------
+var map = L.map('map').setView([0, 0], 16);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19
+}).addTo(map);
+
+// Polyline + marker
+var polyline = null;
+var marker = L.circleMarker([0, 0], {
+    radius: 7,
+    color: "red",
+    fillColor: "red",
+    fillOpacity: 1.0
+}).addTo(map);
+
+// ------------------------------
+// Notify Python when map is ready
+// ------------------------------
+map.whenReady(function () {
+    console.log("Leaflet map ready");
+    console.log("window.pyReady is:", window.pyReady);
+    if (window.pyReady) {
+        console.log("Calling window.pyReady()");
+        window.pyReady();
+    }
+});
+
+
+
+// ------------------------------
+// Called by Python
+// ------------------------------
+function setPolyline(coords) {
+    if (polyline) {
+        map.removeLayer(polyline);
+    }
+    polyline = L.polyline(coords, {
+        color: "blue",
+        weight: 3,
+        opacity: 0.7
+    }).addTo(map);
+}
+
+function moveMarker(lat, lng) {
+    marker.setLatLng([lat, lng]);
+    map.panTo([lat, lng], {animate: true, duration: 0.25});
+}
+
+</script>
+
+</body>
+</html>
