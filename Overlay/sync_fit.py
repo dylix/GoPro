@@ -112,6 +112,7 @@ class SyncTool(QtWidgets.QWidget):
 
     def __init__(self, video_path, fit_path, parent=None):
         super().__init__(parent)
+        self.video_file = Path(video_path).name
 
         # ---------------------------------------------------------
         # AUTO‑SCALING SETUP (DPI + SCREEN SIZE)
@@ -399,25 +400,29 @@ class SyncTool(QtWidgets.QWidget):
         self.map_update_signal.emit(self.current_fit_index)
 
         # ---------------------------------------------------------
-        # LOAD EXISTING MARKERS (unchanged)
+        # LOAD EXISTING MARKERS (if present AND video matches)
         # ---------------------------------------------------------
         markers_path = Path("sync_markers.json")
         if markers_path.exists():
             try:
                 with markers_path.open("r", encoding="utf-8") as f:
-                    self.sync_markers = json.load(f)
-                print(f"Loaded {len(self.sync_markers)} existing markers from sync_markers.json")
+                    data = json.load(f)
 
-                self.refresh_marker_list()
+                saved_video = data.get("video_file")
+                saved_markers = data.get("markers", [])
 
-                self.slider.set_markers(
-                    [m["video_sec"] for m in self.sync_markers],
-                    self.total_video_duration,
-                    self.group_boundaries
-                )
+                if saved_video != self.video_file:
+                    print(f"Markers belong to different video ({saved_video}), ignoring.")
+                    # Optional: auto-clear mismatched file
+                    # markers_path.unlink()
+                else:
+                    self.sync_markers = saved_markers
+                    print(f"Loaded {len(self.sync_markers)} markers for {saved_video}")
+                    self.refresh_marker_list()
 
             except Exception as e:
                 print("ERROR loading sync_markers.json:", e)
+
 
         # ---------------------------------------------------------
         # PLAYBACK TIMER + SHORTCUTS (unchanged)
@@ -1061,16 +1066,24 @@ class SyncTool(QtWidgets.QWidget):
         if not self.sync_markers:
             print("No markers to save.")
             return
+
         out_path = Path("sync_markers.json")
+        payload = {
+            "video_file": self.video_file,   # <-- store the actual video filename
+            "markers": self.sync_markers
+        }
+
         with out_path.open("w", encoding="utf-8") as f:
-            json.dump(self.sync_markers, f, indent=2)
+            json.dump(payload, f, indent=2)
+
         self.slider.set_markers(
             [m["video_sec"] for m in self.sync_markers],
             self.total_video_duration,
             self.group_boundaries
         )
 
-        print("Saved markers to", out_path)
+        print(f"Saved {len(self.sync_markers)} markers for video:", self.video_file)
+
 
 class MarkerSlider(QtWidgets.QSlider):
     def __init__(self, orientation, parent=None):

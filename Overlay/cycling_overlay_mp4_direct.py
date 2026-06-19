@@ -410,8 +410,30 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
         chapter_meta = json.load(f)
 
     print("Loading sync markers…")
-    with open(find_sync_markers(), "r", encoding="utf-8") as f:
-        sync_markers = json.load(f)
+    marker_path = find_sync_markers()
+
+    with marker_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # NEW FORMAT
+    if isinstance(data, dict):
+        saved_video = data.get("video_file")
+        markers = data.get("markers", [])
+
+        if saved_video != video_path.name:
+            print(f"Sync markers belong to different video ({saved_video}), ignoring.")
+            sync_markers = []
+        else:
+            sync_markers = markers
+
+    # OLD FORMAT (raw list)
+    elif isinstance(data, list):
+        sync_markers = data
+
+    else:
+        print("Unknown sync marker format, ignoring.")
+        sync_markers = []
+
 
     print("Building GoPro group map…")
     groups = build_group_map(chapter_meta, sync_markers)

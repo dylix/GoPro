@@ -1,3 +1,4 @@
 *.json
 old.scripts/
 token.json.old
+Overlay/hud_overlay.ass
