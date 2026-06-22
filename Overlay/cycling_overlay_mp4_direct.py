@@ -375,7 +375,6 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
     with open("hud_overlay.ass", "rb") as f:
         print(f.read(32))
 
-
 # ------------------------------------------------------------
 # VIDEO DURATION
 # ------------------------------------------------------------
@@ -434,7 +433,6 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
         print("Unknown sync marker format, ignoring.")
         sync_markers = []
 
-
     print("Building GoPro group map…")
     groups = build_group_map(chapter_meta, sync_markers)
 
@@ -459,8 +457,7 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     ass_path = (OVERLAY_DIR / ASS_FILE)
     #vf_arg = f"subtitles=filename={ass_path.as_posix()}"
     #vf_arg = "".join(vf_arg.splitlines())
-
-    print("ASS FILE CONTENTS:\n", ass_path.read_text(encoding="utf-8")[:200])
+    #print("ASS FILE CONTENTS:\n", ass_path.read_text(encoding="utf-8")[:200])
 
     if use_ass:
         ffmpeg_cmd = [
@@ -493,7 +490,7 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
             "-t", str(t_limit),
             str(output_mp4),
         ]
-    print("ARGV:", ffmpeg_cmd)
+    #print("ARGV:", ffmpeg_cmd)
 
     #print(" ".join(ffmpeg_cmd))
 
@@ -509,10 +506,10 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP  # ffmpeg gets its own group
     )
 
-    print("OVERLAY_DIR:", OVERLAY_DIR)
-    print("PID FILE PATH:", OVERLAY_DIR / "ffmpeg_pid.json")
-    print("DIR EXISTS:", (OVERLAY_DIR).exists())
-    print("CWD:", os.getcwd())
+    #print("OVERLAY_DIR:", OVERLAY_DIR)
+    #print("PID FILE PATH:", OVERLAY_DIR / "ffmpeg_pid.json")
+    #print("DIR EXISTS:", (OVERLAY_DIR).exists())
+    #print("CWD:", os.getcwd())
     # Write PID immediately
     PID_FILE.write_text(json.dumps({"pid": process.pid}))
 

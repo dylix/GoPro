@@ -319,7 +319,9 @@ def process_gopro_with_music_in_one_pass():
             match_pct = (p['duration'] / day_duration_sec) * 100
             print(f"{i}. {p['title']} - {p['duration']/60:.1f} min ({match_pct:.0f}%) - {p['url']}")
 
-        default_choice = 1  # best match is first after sorting
+        # pick a random valid default choice
+        default_choice = random.randint(1, len(playlist_info))
+
         start_alerts()
         choice = input_with_timeout(
             f"📝 [{day_key}] Enter the number of the playlist you want to download "
@@ -328,6 +330,7 @@ def process_gopro_with_music_in_one_pass():
             require_input=False, retries=0
         )
         stop_all_alerts()
+
 
         if choice is None or choice < 1 or choice > len(playlist_info):
             print(f"⚠️ Invalid or no choice for {day_key}, using default #{default_choice}.")
@@ -502,12 +505,33 @@ def format_ts(sec):
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 def build_youtube_chapters(chapter_durations):
+    from pathlib import Path
+    import re
+
+    # 1. Group by GoPro prefix (everything before -GX)
+    groups = {}
+    prefix_re = re.compile(r"^(.*)-GX\d{2}\d{4}$")
+
+    for name, dur in chapter_durations:
+        stem = Path(name).stem
+        m = prefix_re.match(stem)
+        if not m:
+            # fallback: treat whole stem as prefix
+            prefix = stem
+        else:
+            prefix = m.group(1)
+
+        groups.setdefault(prefix, 0)
+        groups[prefix] += dur
+
+    # 2. Build chapters in sorted prefix order
     lines = []
     cumulative = 0
-    for name, dur in chapter_durations:
-        clean_name = Path(name).stem.replace("combined-", "")
-        lines.append(f"{format_ts(cumulative)} {clean_name}")
-        cumulative += dur
+
+    for prefix in sorted(groups.keys()):
+        lines.append(f"{format_ts(cumulative)} {prefix}")
+        cumulative += groups[prefix]
+
     return "\n".join(lines)
 
 def get_duration_seconds(path):
@@ -829,8 +853,8 @@ def download_single_mp3(url, output_path, archive_path):
     }
 
     try:
-        print(ydl_opts)
-        print(url)
+        #print(ydl_opts)
+        #print(url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         return f"✅ Downloaded: {url}"

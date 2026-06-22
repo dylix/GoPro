@@ -122,7 +122,7 @@ class SyncTool(QtWidgets.QWidget):
 
         self.screen_w = screen.width()
         self.screen_h = screen.height()
-
+        self.user_dragging_fit = False
         # Target window height = 90% of screen height
         self.target_h = int(self.screen_h * 0.90)
 
@@ -212,6 +212,8 @@ class SyncTool(QtWidgets.QWidget):
         self.fit_slider.setMinimum(0)
         self.fit_slider.setMaximum(len(self.fit_points) - 1)
         self.fit_slider.valueChanged.connect(self.on_fit_slider)
+        self.fit_slider.sliderPressed.connect(self.on_fit_slider_pressed)
+        self.fit_slider.sliderReleased.connect(self.on_fit_slider_released)
 
         policy = QtWidgets.QSizePolicy(QtWidgets.QSizePolicy.Expanding,
                                        QtWidgets.QSizePolicy.Fixed)
@@ -423,7 +425,6 @@ class SyncTool(QtWidgets.QWidget):
             except Exception as e:
                 print("ERROR loading sync_markers.json:", e)
 
-
         # ---------------------------------------------------------
         # PLAYBACK TIMER + SHORTCUTS (unchanged)
         # ---------------------------------------------------------
@@ -584,7 +585,6 @@ class SyncTool(QtWidgets.QWidget):
             print("No ffmpeg PID found")
         os.remove("ffmpeg_pid.json")
 
-
     def on_process_output(self):
         data = self.process.readAll().data().decode("utf-8", errors="ignore")
         self.log_window.appendPlainText(data)
@@ -660,7 +660,6 @@ class SyncTool(QtWidgets.QWidget):
         # --- Update progress bar text ---
         self.progress_bar.setFormat(f"{pct}%  —  ETA {eta_str}")
         self.progress_bar.setAlignment(QtCore.Qt.AlignCenter)
-
 
     def on_process_finished(self, exit_code, exit_status):
         self.log_window.appendPlainText("\n--- PROCESS FINISHED ---")
@@ -913,31 +912,69 @@ class SyncTool(QtWidgets.QWidget):
         if self.paused:
             return
 
+        now = time.time()
+
+        # First tick: initialize clock
+        if not hasattr(self, "play_clock"):
+            self.play_clock = now
+            self.video_clock = 0.0  # seconds of video elapsed
+            self.last_frame_time = now
+
+        # How much real time has passed?
+        elapsed = now - self.last_frame_time
+        self.last_frame_time = now
+
+        # Advance video clock
+        self.video_clock += elapsed
+
+        # Compute which frame we *should* be on
+        target_frame = int(self.video_clock * self.fps)
+
+        # Current frame according to OpenCV
+        current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+        # If we're behind, skip frames
+        if target_frame > current_frame:
+            # Skip forward by reading and discarding frames
+            skip = target_frame - current_frame
+            for _ in range(skip):
+                ret, _ = self.cap.read()
+                if not ret:
+                    self.timer.stop()
+                    self.paused = True
+                    return
+
+        # Read the next frame normally
         ret, frame = self.cap.read()
         if not ret:
             self.timer.stop()
+            self.paused = True
             return
 
+        # --- Display frame ---
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame_small = cv2.resize(frame_rgb, (960, 540), interpolation=cv2.INTER_AREA)
         h, w, ch = frame_small.shape
         img = QtGui.QImage(frame_small.data, w, h, ch * w, QtGui.QImage.Format_RGB888)
         self.video_label.setPixmap(QtGui.QPixmap.fromImage(img))
 
+        # --- Update slider ---
         frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
         self.slider.blockSignals(True)
         self.slider.setValue(frame_idx)
         self.slider.blockSignals(False)
 
+        # --- FIT mapping ---
         video_sec = frame_idx / self.fps
         fit_idx = self.video_time_to_fit_index(video_sec)
 
-        if fit_idx != self.current_fit_index:
+        if not self.user_dragging_fit and fit_idx != self.current_fit_index:
             self.current_fit_index = fit_idx
             self.fit_slider.blockSignals(True)
             self.fit_slider.setValue(fit_idx)
             self.fit_slider.blockSignals(False)
             self.map_update_signal.emit(fit_idx)
+
 
     def on_slider(self, frame_idx: int):
         # --- SAFETY: stop playback before seeking ---
@@ -978,7 +1015,10 @@ class SyncTool(QtWidgets.QWidget):
 
         self.current_fit_index = fit_idx
         self.fit_slider.blockSignals(True)
-        self.fit_slider.setValue(fit_idx)
+        if not self.user_dragging_fit:
+            self.fit_slider.blockSignals(True)
+            self.fit_slider.setValue(fit_idx)
+            self.fit_slider.blockSignals(False)
         self.fit_slider.blockSignals(False)
 
         self.map_update_signal.emit(fit_idx)
@@ -994,8 +1034,27 @@ class SyncTool(QtWidgets.QWidget):
             self.btn_play.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MediaPlay))
             self.btn_play.setText("Play")
 
+        # --- USER DRAGGING: update map live ---
+        if self.user_dragging_fit:
+            self.current_fit_index = fit_idx
+            self.map_update_signal.emit(fit_idx)
+            return
+
+        # --- PROGRAMMATIC UPDATE: normal path ---
         self.current_fit_index = fit_idx
         self.map_update_signal.emit(fit_idx)
+
+
+        if not self.user_dragging_fit:
+            self.current_fit_index = fit_idx
+            self.map_update_signal.emit(fit_idx)
+
+
+    def on_fit_slider_pressed(self):
+        self.user_dragging_fit = True
+
+    def on_fit_slider_released(self):
+        self.user_dragging_fit = False
 
     # ---------------------------------------------------------
     # SIMPLE VIDEO→FIT MAPPING (to be refined with markers)
@@ -1083,7 +1142,6 @@ class SyncTool(QtWidgets.QWidget):
         )
 
         print(f"Saved {len(self.sync_markers)} markers for video:", self.video_file)
-
 
 class MarkerSlider(QtWidgets.QSlider):
     def __init__(self, orientation, parent=None):
@@ -1336,4 +1394,3 @@ if __name__ == "__main__":
     w.setWindowTitle("FIT ↔ Video Sync Tool (GoPro Group Sync)")
     w.show()
     sys.exit(app.exec_())
-
