@@ -8,7 +8,13 @@ import sys
 import subprocess
 import fitdecode
 import secrets
-
+import requests
+from PIL import Image, ImageDraw
+from io import BytesIO
+import math
+import sqlite3
+from PIL import Image
+from io import BytesIO
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
@@ -38,6 +44,10 @@ ICON_CAD   = "⟳"
 ICON_DIST  = "📏️"
 ICON_ELEV  = "🏔️"
 ICON_TIME  = "⏱"
+
+last_center_tile = None
+last_rendered_map = None
+map_center_tile = None
 
 # ------------------------------------------------------------
 # AUTO-DETECT INPUTS
@@ -132,7 +142,6 @@ def map_video_to_fit(video_sec, groups):
 # ------------------------------------------------------------
 # FIT LOADING
 # ------------------------------------------------------------
-
 def load_fit(path: Path):
     pts = []
     with fitdecode.FitReader(path) as fit:
@@ -140,6 +149,7 @@ def load_fit(path: Path):
             if not isinstance(frame, fitdecode.records.FitDataMessage):
                 continue
             row = {f.name: f.value for f in frame.fields}
+
             ts = row.get("timestamp")
             if ts is None:
                 continue
@@ -147,11 +157,30 @@ def load_fit(path: Path):
             if ts.tzinfo is not None:
                 ts = ts.astimezone().replace(tzinfo=None)
 
+            # -----------------------------
+            # GPS extraction (NEW)
+            # -----------------------------
+            lat_sc = row.get("position_lat")
+            lon_sc = row.get("position_long")
+
+            if lat_sc is not None and lon_sc is not None:
+                # Garmin semicircles → degrees
+                lat = lat_sc * (180.0 / 2**31)
+                lon = lon_sc * (180.0 / 2**31)
+            else:
+                lat = None
+                lon = None
+
+            # -----------------------------
+            # Existing fields
+            # -----------------------------
             speed = row.get("enhanced_speed") or row.get("speed")
             altitude = row.get("enhanced_altitude") or row.get("altitude")
 
             pts.append({
                 "timestamp": ts,
+                "lat": lat,          # NEW
+                "lon": lon,          # NEW
                 "speed": speed,
                 "hr": row.get("heart_rate"),
                 "cadence": row.get("cadence"),
@@ -191,13 +220,26 @@ def interpolate_fit(points, fit_ts):
     if t1 == t0:
         return p0
 
-    alpha = (fit_ts - t0).total_seconds() / (t1 - t0).total_seconds()
-
+    # -----------------------------
+    # define lerp BEFORE using it
+    # -----------------------------
     def lerp(a, b):
         if a is None or b is None:
             return None
-        return a + (b - a) * alpha
+        return a + (b - a) * (
+            (fit_ts - t0).total_seconds() /
+            (t1 - t0).total_seconds()
+        )
 
+    # -----------------------------
+    # GPS interpolation (NEW)
+    # -----------------------------
+    lat = lerp(p0.get("lat"), p1.get("lat"))
+    lon = lerp(p0.get("lon"), p1.get("lon"))
+
+    # -----------------------------
+    # moving time interpolation
+    # -----------------------------
     mt0 = p0.get("moving_time")
     mt1 = p1.get("moving_time")
     if mt0 is None or mt1 is None:
@@ -205,8 +247,13 @@ def interpolate_fit(points, fit_ts):
     else:
         moving_time = lerp(mt0, mt1)
 
+    # -----------------------------
+    # return full interpolated point
+    # -----------------------------
     return {
         "timestamp": fit_ts,
+        "lat": lat,
+        "lon": lon,
         "speed":   lerp(p0["speed"],   p1["speed"]),
         "hr":      lerp(p0["hr"],      p1["hr"]),
         "cadence": lerp(p0["cadence"], p1["cadence"]),
@@ -221,6 +268,11 @@ def interpolate_fit(points, fit_ts):
 # ------------------------------------------------------------
 
 def postprocess_points(points):
+    # Add relative time (seconds from start)
+    t0 = points[0]["timestamp"]
+    for p in points:
+        p["time"] = (p["timestamp"] - t0).total_seconds()
+
     # Normalize distance
     first_dist = points[0]["distance"] or 0.0
     for p in points:
@@ -255,6 +307,8 @@ def ass_time(t):
 
 def generate_ass(points, duration, ass_path: Path, groups):
     max_t = duration
+    map_dir = Path("map_frames")
+    map_dir.mkdir(exist_ok=True)
 
     header = "[Script Info]\n" + r"""ScriptType: v4.00+
 PlayResX: 3840
@@ -318,12 +372,31 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
         fit_ts = map_video_to_fit(t, groups)
         return interpolate_fit(points, fit_ts)
 
+    print("Generating map frames...")
+
+    last_map_second = None
+    last_map = None
+
     for frame in range(int(max_t * FPS)):
         t0 = frame / FPS
         t1 = (frame + 1) / FPS
 
         tele = tele_at(t0)
+        lat = tele["lat"]
+        lon = tele["lon"]
 
+        if lat is None or lon is None:
+            continue
+
+        current_sec = int(t0)
+
+        # --- Only render map once per second ---
+        if last_map is None or current_sec != last_map_second:
+            last_map = render_map(lat, lon, points)
+            last_map.save(map_dir / f"map_{current_sec:06d}.png")
+            last_map_second = current_sec
+
+        # HUD text (30 fps)
         speed_mps = tele["speed"]
         speed_mph = None if speed_mps is None else speed_mps * 2.23694
         hr = tele["hr"]
@@ -364,16 +437,126 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
 
     ass_text = "".join(lines)
 
-    # ⭐ Strip BOM + any accidental leading whitespace/newlines
+    # Strip BOM + accidental whitespace
     while ass_text and ass_text[0] in ("\ufeff", "\n", "\r", "\t", " "):
         ass_text = ass_text[1:]
 
     with open(ass_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(ass_text)
-    with open(ass_path, "rb") as f:
-        print(f.read(16))
-    with open("hud_overlay.ass", "rb") as f:
-        print(f.read(32))
+
+# ------------------------------------------------------------
+# MAP
+# ------------------------------------------------------------
+MBTILES_PATH = r"D:\Users\dylix\Downloads\Mobile Atlas Creator 2.3.3\atlases\mytiles.mbtiles"
+_conn = sqlite3.connect(MBTILES_PATH)
+_cursor = _conn.cursor()
+tile_cache = {}
+
+def fetch_tile(x, y, z):
+    key = (z, x, y)
+    if key in tile_cache:
+        return tile_cache[key]
+
+    tms_y = (2**z - 1) - y
+
+    row = _cursor.execute(
+        "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+        (z, x, tms_y)
+    ).fetchone()
+
+    if row is None:
+        img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    else:
+        img = Image.open(BytesIO(row[0])).convert("RGBA")
+
+    tile_cache[key] = img
+    return img
+
+def latlon_to_tile(lat, lon, zoom):
+    lat_rad = math.radians(lat)
+    n = 2.0 ** zoom
+    x = (lon + 180.0) / 360.0 * n
+    y = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n
+    return x, y
+
+def render_map(lat, lon, route_points, zoom=14, size=300):
+    global last_center_tile, last_rendered_map, map_center_tile
+
+    # --- 1. Compute rider tile (fractional) ---
+    rx, ry = latlon_to_tile(lat, lon, zoom)
+
+    # --- 2. Initialize center tile (INTEGER) ---
+    if map_center_tile is None:
+        map_center_tile = (int(rx), int(ry))
+
+    cx, cy = map_center_tile
+
+    # --- 3. Hysteresis: recenter only when rider moves > 0.5 tile ---
+    if abs(rx - cx) > 0.5 or abs(ry - cy) > 0.5:
+        map_center_tile = (int(rx), int(ry))
+        cx, cy = map_center_tile
+
+    center_tile = (cx, cy)
+
+    # --- 4. Only redraw tiles when center tile changes ---
+    if center_tile != last_center_tile:
+        tiles = {}
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                # fetch_tile expects INTEGER tile indices
+                tiles[(dx, dy)] = fetch_tile(cx + dx, cy + dy, zoom)
+
+        base_map = Image.new("RGB", (256 * 3, 256 * 3))
+        for (dx, dy), tile in tiles.items():
+            base_map.paste(tile, ((dx + 1) * 256, (dy + 1) * 256))
+
+        last_rendered_map = base_map
+        last_center_tile = center_tile
+
+    # --- 5. Draw overlays on cached map ---
+    map_img = last_rendered_map.copy()
+    draw = ImageDraw.Draw(map_img)
+
+    # --- 6. Projection into stitched 3×3 tile grid ---
+    def project(lat, lon):
+        x, y = latlon_to_tile(lat, lon, zoom)
+
+        # integer tile index
+        tx = int(x)
+        ty = int(y)
+
+        # fractional offset inside tile
+        fx = x - tx
+        fy = y - ty
+
+        # TMS projection (tile fetch already flipped)
+        px = (tx - (cx - 1)) * 256 + fx * 256
+        py = ((cy + 1) - ty) * 256 + fy * 256
+
+        return px, py
+
+    # --- 7. Breadcrumb trail (last 10 seconds) ---
+    BREADCRUMB_SECONDS = 10
+    t_now = route_points[-1]["time"]
+
+    recent = [p for p in route_points if p["time"] >= t_now - BREADCRUMB_SECONDS]
+    trail = [project(p["lat"], p["lon"]) for p in recent if p["lat"] and p["lon"]]
+
+    if len(trail) > 1:
+        steps = len(trail)
+        for i in range(1, steps):
+            alpha = int(255 * (i / steps))
+            color = (255, 255, 255, alpha)
+            draw.line([trail[i-1], trail[i]], fill=color, width=4)
+
+    # --- 8. Draw rider ---
+    px, py = project(lat, lon)
+    draw.ellipse((px - 8, py - 8, px + 8, py + 8), fill="red")
+
+    # --- 9. Crop around rider ---
+    left = int(px - size / 2)
+    top = int(py - size / 2)
+    return map_img.crop((left, top, left + size, top + size))
 
 # ------------------------------------------------------------
 # VIDEO DURATION
@@ -465,8 +648,16 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
             "-y",
             "-progress", "pipe:1",
             "-nostats",
-            "-i", str(video_path),
-            "-vf", f"subtitles={ass_path.as_posix().replace(':', '\\\\:')}",
+
+            "-i", str(video_path),              # 30 fps GoPro video
+            "-framerate", "1",                  # map is 1 fps
+            "-i", "map_frames/map_%06d.png",    # 1 fps map sequence
+
+            "-filter_complex",
+            "[1:v]fps=30[map30];"               # upsample map to 30 fps
+            "[0:v][map30]overlay=main_w-350:50[sub];"
+            f"[sub]subtitles={ass_path.as_posix().replace(':','\\\\:')}",
+
             "-c:v", "h264_nvenc",
             "-preset", "p5",
             "-b:v", "40M",
