@@ -393,6 +393,7 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
         # --- Only render map once per second ---
         if last_map is None or current_sec != last_map_second:
             last_map = render_map(lat, lon, points)
+            current_sec = int(current_sec)
             last_map.save(map_dir / f"map_{current_sec:06d}.png")
             last_map_second = current_sec
 
@@ -479,63 +480,69 @@ def latlon_to_tile(lat, lon, zoom):
     y = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n
     return x, y
 
-def render_map(lat, lon, route_points, zoom=14, size=300):
+def render_map(lat, lon, route_points, zoom=14, size=1000, tile_grid=5):
     global last_center_tile, last_rendered_map, map_center_tile
 
-    # --- 1. Compute rider tile (fractional) ---
+    assert tile_grid % 2 == 1, "tile_grid must be odd (3,5,7,9...)"
+
+    half = tile_grid // 2
+    TILE = 256
+    stitched_size = TILE * tile_grid
+
+    # --- 1. Rider fractional tile ---
     rx, ry = latlon_to_tile(lat, lon, zoom)
 
-    # --- 2. Initialize center tile (INTEGER) ---
+    # --- 2. Initialize center tile ---
     if map_center_tile is None:
         map_center_tile = (int(rx), int(ry))
 
     cx, cy = map_center_tile
 
-    # --- 3. Hysteresis: recenter only when rider moves > 0.5 tile ---
+    # --- 3. Hysteresis ---
     if abs(rx - cx) > 0.5 or abs(ry - cy) > 0.5:
         map_center_tile = (int(rx), int(ry))
         cx, cy = map_center_tile
 
     center_tile = (cx, cy)
 
-    # --- 4. Only redraw tiles when center tile changes ---
+    # --- 4. Redraw only when center tile changes ---
     if center_tile != last_center_tile:
         tiles = {}
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                # fetch_tile expects INTEGER tile indices
+
+        for dx in range(-half, half + 1):
+            for dy in range(-half, half + 1):
                 tiles[(dx, dy)] = fetch_tile(cx + dx, cy + dy, zoom)
 
-        base_map = Image.new("RGB", (256 * 3, 256 * 3))
+        base_map = Image.new("RGB", (stitched_size, stitched_size))
+
         for (dx, dy), tile in tiles.items():
-            base_map.paste(tile, ((dx + 1) * 256, (dy + 1) * 256))
+            px = (dx + half) * TILE
+            py = (dy + half) * TILE
+            base_map.paste(tile, (px, py))
 
         last_rendered_map = base_map
         last_center_tile = center_tile
 
-    # --- 5. Draw overlays on cached map ---
+    # --- 5. Draw overlays ---
     map_img = last_rendered_map.copy()
     draw = ImageDraw.Draw(map_img)
 
-    # --- 6. Projection into stitched 3×3 tile grid ---
+    # --- 6. Projection into stitched grid ---
     def project(lat, lon):
         x, y = latlon_to_tile(lat, lon, zoom)
 
-        # integer tile index
         tx = int(x)
         ty = int(y)
 
-        # fractional offset inside tile
         fx = x - tx
         fy = y - ty
 
-        # TMS projection (tile fetch already flipped)
-        px = (tx - (cx - 1)) * 256 + fx * 256
-        py = ((cy + 1) - ty) * 256 + fy * 256
+        px = (tx - (cx - half)) * TILE + fx * TILE
+        py = ((cy + half) - ty) * TILE + fy * TILE
 
         return px, py
 
-    # --- 7. Breadcrumb trail (last 10 seconds) ---
+    # --- 7. Breadcrumb trail ---
     BREADCRUMB_SECONDS = 10
     t_now = route_points[-1]["time"]
 
@@ -549,13 +556,14 @@ def render_map(lat, lon, route_points, zoom=14, size=300):
             color = (255, 255, 255, alpha)
             draw.line([trail[i-1], trail[i]], fill=color, width=4)
 
-    # --- 8. Draw rider ---
+    # --- 8. Rider dot ---
     px, py = project(lat, lon)
     draw.ellipse((px - 8, py - 8, px + 8, py + 8), fill="red")
 
     # --- 9. Crop around rider ---
     left = int(px - size / 2)
     top = int(py - size / 2)
+
     return map_img.crop((left, top, left + size, top + size))
 
 # ------------------------------------------------------------
@@ -654,8 +662,7 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
             "-i", "map_frames/map_%06d.png",    # 1 fps map sequence
 
             "-filter_complex",
-            "[1:v]fps=30[map30];"               # upsample map to 30 fps
-            "[0:v][map30]overlay=main_w-350:50[sub];"
+            "[1:v]fps=30[map30];[0:v][map30]overlay=main_w-1000-50:50[sub];"
             f"[sub]subtitles={ass_path.as_posix().replace(':','\\\\:')}",
 
             "-c:v", "h264_nvenc",
