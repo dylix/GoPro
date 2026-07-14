@@ -480,7 +480,7 @@ def latlon_to_tile(lat, lon, zoom):
     y = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n
     return x, y
 
-def render_map(lat, lon, route_points, zoom=14, size=1000, tile_grid=5):
+def render_map(lat, lon, route_points, zoom=15, size=1000, tile_grid=5):
     global last_center_tile, last_rendered_map, map_center_tile
 
     assert tile_grid % 2 == 1, "tile_grid must be odd (3,5,7,9...)"
