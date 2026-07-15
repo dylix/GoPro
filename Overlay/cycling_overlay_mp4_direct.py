@@ -21,7 +21,7 @@ import threading
 FPS = 30
 WIDTH, HEIGHT = 3840, 2160
 
-PREVIEW_SECONDS = None
+PREVIEW_SECONDS = 10
 
 TODAY_DIR = Path(r"D:\GoPro\Today")
 OVERLAY_DIR = Path(r"D:\Users\dylix\source\repos\GoPro\Overlay")
@@ -447,25 +447,54 @@ def latlon_to_tile(lat, lon, zoom):
 def render_map(lat, lon, route_points, zoom=15, size=MAP_SIZE, tile_grid=MAP_TILE_GRID):
     TILE = 256
 
+    # Rider tile
     rx, ry = latlon_to_tile(lat, lon, zoom)
     cx = int(rx)
     cy = int(ry)
 
-    tile = fetch_tile(cx, cy, zoom)
-    map_img = tile.copy().convert("RGBA")
-    map_img = map_img.resize((size, size), Image.BILINEAR)
-    draw = ImageDraw.Draw(map_img)
+    # Build REAL 3×3 tile map (no transparent padding)
+    padded = Image.new("RGBA", (TILE * 3, TILE * 3), (0, 0, 0, 0))
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            tx = cx + dx
+            ty = cy + dy
+            tile = fetch_tile(tx, ty, zoom)
+            padded.paste(tile, ((dx + 1) * TILE, (dy + 1) * TILE))
 
-    def project(lat, lon):
+    # lat/lon → padded coordinates
+    def project_raw(lat, lon):
         x, y = latlon_to_tile(lat, lon, zoom)
         fx = x - cx
         fy = y - cy
-        return fx * size, fy * size
+        return fx * TILE + TILE, fy * TILE + TILE
 
     BREADCRUMB_SECONDS = 10
     t_now = route_points[-1]["time"]
     recent = [p for p in route_points if p["time"] >= t_now - BREADCRUMB_SECONDS]
-    trail = [project(p["lat"], p["lon"]) for p in recent if p["lat"] and p["lon"]]
+    trail_raw = [project_raw(p["lat"], p["lon"]) for p in recent if p["lat"] and p["lon"]]
+
+    # Rider position in padded space
+    px, py = project_raw(lat, lon)
+
+    # Viewport: 1 tile (256×256) centered on rider, clamped inside 3×3
+    view_size = TILE
+    left = px - view_size // 2
+    top  = py - view_size // 2
+
+    max_edge = TILE * 3 - view_size
+    left = max(0, min(left, max_edge))
+    top  = max(0, min(top, max_edge))
+
+    # Crop 256×256 around rider
+    cropped = padded.crop((left, top, left + view_size, top + view_size))
+
+    # Resize to final overlay size
+    map_img = cropped.resize((size, size), Image.BILINEAR)
+    draw = ImageDraw.Draw(map_img)
+
+    # Scale trail into resized viewport
+    scale = size / view_size
+    trail = [((x - left) * scale, (y - top) * scale) for (x, y) in trail_raw]
 
     if len(trail) > 1:
         steps = len(trail)
@@ -474,8 +503,10 @@ def render_map(lat, lon, route_points, zoom=15, size=MAP_SIZE, tile_grid=MAP_TIL
             color = (255, 255, 255, alpha)
             draw.line([trail[i-1], trail[i]], fill=color, width=4)
 
-    px, py = project(lat, lon)
-    draw.ellipse((px - 8, py - 8, px + 8, py + 8), fill="red")
+    # Dot ALWAYS centered in final image
+    dot_x = size // 2
+    dot_y = size // 2
+    draw.ellipse((dot_x - 8, dot_y - 8, dot_x + 8, dot_y + 8), fill="red")
 
     return map_img
 
