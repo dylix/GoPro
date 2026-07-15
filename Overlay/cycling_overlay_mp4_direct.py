@@ -5,7 +5,6 @@ import json
 import os
 import signal
 import sys
-import subprocess
 import fitdecode
 import secrets
 import requests
@@ -13,8 +12,8 @@ from PIL import Image, ImageDraw
 from io import BytesIO
 import math
 import sqlite3
-from PIL import Image
-from io import BytesIO
+import threading
+
 # ------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------
@@ -49,9 +48,14 @@ last_center_tile = None
 last_rendered_map = None
 map_center_tile = None
 
+MAP_SIZE = 700      # map render size (square), good for 4K
+MAP_DISPLAY_SIZE = MAP_SIZE
+MAP_TILE_GRID = 1   # single-tile renderer
+
 # ------------------------------------------------------------
 # AUTO-DETECT INPUTS
 # ------------------------------------------------------------
+
 def cancel_encoding():
     if process:
         process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -93,12 +97,11 @@ def generate_hashed_overlay_name(video_path: Path) -> Path:
 def extract_group_key(filename: str) -> str:
     base = filename.split("-")[-1]
     core = base.split(".")[0]
-    return core[-4:]  # "1102"
+    return core[-4:]
 
 def build_group_map(meta, sync_markers):
     chapters = meta["chapters"]
 
-    # 1. Build groups
     groups = []
     for ch in chapters:
         gkey = extract_group_key(ch["file"])
@@ -109,14 +112,12 @@ def build_group_map(meta, sync_markers):
         else:
             groups[-1]["duration"] += dur
 
-    # 2. Compute video boundaries
     t = 0
     for g in groups:
         g["video_start_sec"] = t
         g["video_end_sec"] = t + g["duration"]
         t += g["duration"]
 
-    # 3. Attach sync markers
     for m in sync_markers:
         gi = m["group"]
         groups[gi]["anchor_video_sec"] = m["video_sec"]
@@ -132,7 +133,6 @@ def map_video_to_fit(video_sec, groups):
             delta = video_sec - anchor_video
             return anchor_fit + timedelta(seconds=delta)
 
-    # clamp to last group
     g = groups[-1]
     anchor_video = g["anchor_video_sec"]
     anchor_fit = datetime.fromisoformat(g["anchor_fit_timestamp"])
@@ -142,6 +142,7 @@ def map_video_to_fit(video_sec, groups):
 # ------------------------------------------------------------
 # FIT LOADING
 # ------------------------------------------------------------
+
 def load_fit(path: Path):
     pts = []
     with fitdecode.FitReader(path) as fit:
@@ -157,30 +158,23 @@ def load_fit(path: Path):
             if ts.tzinfo is not None:
                 ts = ts.astimezone().replace(tzinfo=None)
 
-            # -----------------------------
-            # GPS extraction (NEW)
-            # -----------------------------
             lat_sc = row.get("position_lat")
             lon_sc = row.get("position_long")
 
             if lat_sc is not None and lon_sc is not None:
-                # Garmin semicircles → degrees
                 lat = lat_sc * (180.0 / 2**31)
                 lon = lon_sc * (180.0 / 2**31)
             else:
                 lat = None
                 lon = None
 
-            # -----------------------------
-            # Existing fields
-            # -----------------------------
             speed = row.get("enhanced_speed") or row.get("speed")
             altitude = row.get("enhanced_altitude") or row.get("altitude")
 
             pts.append({
                 "timestamp": ts,
-                "lat": lat,          # NEW
-                "lon": lon,          # NEW
+                "lat": lat,
+                "lon": lon,
                 "speed": speed,
                 "hr": row.get("heart_rate"),
                 "cadence": row.get("cadence"),
@@ -193,7 +187,7 @@ def load_fit(path: Path):
     return pts
 
 # ------------------------------------------------------------
-# FIT INTERPOLATION (timestamp-based)
+# FIT INTERPOLATION
 # ------------------------------------------------------------
 
 def interpolate_fit(points, fit_ts):
@@ -220,9 +214,6 @@ def interpolate_fit(points, fit_ts):
     if t1 == t0:
         return p0
 
-    # -----------------------------
-    # define lerp BEFORE using it
-    # -----------------------------
     def lerp(a, b):
         if a is None or b is None:
             return None
@@ -231,15 +222,9 @@ def interpolate_fit(points, fit_ts):
             (t1 - t0).total_seconds()
         )
 
-    # -----------------------------
-    # GPS interpolation (NEW)
-    # -----------------------------
     lat = lerp(p0.get("lat"), p1.get("lat"))
     lon = lerp(p0.get("lon"), p1.get("lon"))
 
-    # -----------------------------
-    # moving time interpolation
-    # -----------------------------
     mt0 = p0.get("moving_time")
     mt1 = p1.get("moving_time")
     if mt0 is None or mt1 is None:
@@ -247,9 +232,6 @@ def interpolate_fit(points, fit_ts):
     else:
         moving_time = lerp(mt0, mt1)
 
-    # -----------------------------
-    # return full interpolated point
-    # -----------------------------
     return {
         "timestamp": fit_ts,
         "lat": lat,
@@ -268,18 +250,15 @@ def interpolate_fit(points, fit_ts):
 # ------------------------------------------------------------
 
 def postprocess_points(points):
-    # Add relative time (seconds from start)
     t0 = points[0]["timestamp"]
     for p in points:
         p["time"] = (p["timestamp"] - t0).total_seconds()
 
-    # Normalize distance
     first_dist = points[0]["distance"] or 0.0
     for p in points:
         if p["distance"] is not None:
             p["distance"] = max(0.0, p["distance"] - first_dist)
 
-    # Compute moving time
     moving_time = 0.0
     last = points[0]
     points[0]["moving_time"] = 0.0
@@ -307,8 +286,6 @@ def ass_time(t):
 
 def generate_ass(points, duration, ass_path: Path, groups):
     max_t = duration
-    map_dir = Path("map_frames")
-    map_dir.mkdir(exist_ok=True)
 
     header = "[Script Info]\n" + r"""ScriptType: v4.00+
 PlayResX: 3840
@@ -372,32 +349,12 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
         fit_ts = map_video_to_fit(t, groups)
         return interpolate_fit(points, fit_ts)
 
-    print("Generating map frames...")
-
-    last_map_second = None
-    last_map = None
-
     for frame in range(int(max_t * FPS)):
         t0 = frame / FPS
         t1 = (frame + 1) / FPS
 
         tele = tele_at(t0)
-        lat = tele["lat"]
-        lon = tele["lon"]
 
-        if lat is None or lon is None:
-            continue
-
-        current_sec = int(t0)
-
-        # --- Only render map once per second ---
-        if last_map is None or current_sec != last_map_second:
-            last_map = render_map(lat, lon, points)
-            current_sec = int(current_sec)
-            last_map.save(map_dir / f"map_{current_sec:06d}.png")
-            last_map_second = current_sec
-
-        # HUD text (30 fps)
         speed_mps = tele["speed"]
         speed_mph = None if speed_mps is None else speed_mps * 2.23694
         hr = tele["hr"]
@@ -438,7 +395,6 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
 
     ass_text = "".join(lines)
 
-    # Strip BOM + accidental whitespace
     while ass_text and ass_text[0] in ("\ufeff", "\n", "\r", "\t", " "):
         ass_text = ass_text[1:]
 
@@ -446,21 +402,28 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
         f.write(ass_text)
 
 # ------------------------------------------------------------
-# MAP
+# MAP / MBTILES
 # ------------------------------------------------------------
+
 MBTILES_PATH = r"D:\Users\dylix\Downloads\Mobile Atlas Creator 2.3.3\atlases\mytiles.mbtiles"
-_conn = sqlite3.connect(MBTILES_PATH)
-_cursor = _conn.cursor()
 tile_cache = {}
+thread_local = threading.local()
 
 def fetch_tile(x, y, z):
+    # Each thread gets its own SQLite connection
+    if not hasattr(thread_local, "conn"):
+        thread_local.conn = sqlite3.connect(MBTILES_PATH)
+        thread_local.cursor = thread_local.conn.cursor()
+
+    cursor = thread_local.cursor
+
     key = (z, x, y)
     if key in tile_cache:
         return tile_cache[key]
 
     tms_y = (2**z - 1) - y
 
-    row = _cursor.execute(
+    row = cursor.execute(
         "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
         (z, x, tms_y)
     ).fetchone()
@@ -473,6 +436,7 @@ def fetch_tile(x, y, z):
     tile_cache[key] = img
     return img
 
+
 def latlon_to_tile(lat, lon, zoom):
     lat_rad = math.radians(lat)
     n = 2.0 ** zoom
@@ -480,72 +444,26 @@ def latlon_to_tile(lat, lon, zoom):
     y = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n
     return x, y
 
-def render_map(lat, lon, route_points, zoom=15, size=1000, tile_grid=5):
-    global last_center_tile, last_rendered_map, map_center_tile
-
-    assert tile_grid % 2 == 1, "tile_grid must be odd (3,5,7,9...)"
-
-    half = tile_grid // 2
+def render_map(lat, lon, route_points, zoom=15, size=MAP_SIZE, tile_grid=MAP_TILE_GRID):
     TILE = 256
-    stitched_size = TILE * tile_grid
 
-    # --- 1. Rider fractional tile ---
     rx, ry = latlon_to_tile(lat, lon, zoom)
+    cx = int(rx)
+    cy = int(ry)
 
-    # --- 2. Initialize center tile ---
-    if map_center_tile is None:
-        map_center_tile = (int(rx), int(ry))
-
-    cx, cy = map_center_tile
-
-    # --- 3. Hysteresis ---
-    if abs(rx - cx) > 0.5 or abs(ry - cy) > 0.5:
-        map_center_tile = (int(rx), int(ry))
-        cx, cy = map_center_tile
-
-    center_tile = (cx, cy)
-
-    # --- 4. Redraw only when center tile changes ---
-    if center_tile != last_center_tile:
-        tiles = {}
-
-        for dx in range(-half, half + 1):
-            for dy in range(-half, half + 1):
-                tiles[(dx, dy)] = fetch_tile(cx + dx, cy + dy, zoom)
-
-        base_map = Image.new("RGB", (stitched_size, stitched_size))
-
-        for (dx, dy), tile in tiles.items():
-            px = (dx + half) * TILE
-            py = (dy + half) * TILE
-            base_map.paste(tile, (px, py))
-
-        last_rendered_map = base_map
-        last_center_tile = center_tile
-
-    # --- 5. Draw overlays ---
-    map_img = last_rendered_map.copy()
+    tile = fetch_tile(cx, cy, zoom)
+    map_img = tile.copy().convert("RGBA")
+    map_img = map_img.resize((size, size), Image.BILINEAR)
     draw = ImageDraw.Draw(map_img)
 
-    # --- 6. Projection into stitched grid ---
     def project(lat, lon):
         x, y = latlon_to_tile(lat, lon, zoom)
+        fx = x - cx
+        fy = y - cy
+        return fx * size, fy * size
 
-        tx = int(x)
-        ty = int(y)
-
-        fx = x - tx
-        fy = y - ty
-
-        px = (tx - (cx - half)) * TILE + fx * TILE
-        py = ((cy + half) - ty) * TILE + fy * TILE
-
-        return px, py
-
-    # --- 7. Breadcrumb trail ---
     BREADCRUMB_SECONDS = 10
     t_now = route_points[-1]["time"]
-
     recent = [p for p in route_points if p["time"] >= t_now - BREADCRUMB_SECONDS]
     trail = [project(p["lat"], p["lon"]) for p in recent if p["lat"] and p["lon"]]
 
@@ -556,15 +474,10 @@ def render_map(lat, lon, route_points, zoom=15, size=1000, tile_grid=5):
             color = (255, 255, 255, alpha)
             draw.line([trail[i-1], trail[i]], fill=color, width=4)
 
-    # --- 8. Rider dot ---
     px, py = project(lat, lon)
     draw.ellipse((px - 8, py - 8, px + 8, py + 8), fill="red")
 
-    # --- 9. Crop around rider ---
-    left = int(px - size / 2)
-    top = int(py - size / 2)
-
-    return map_img.crop((left, top, left + size, top + size))
+    return map_img
 
 # ------------------------------------------------------------
 # VIDEO DURATION
@@ -586,6 +499,40 @@ def get_video_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 # ------------------------------------------------------------
+# MAP STREAMING
+# ------------------------------------------------------------
+
+def stream_maps(points, duration, groups, process):
+    last_map_second = None
+    last_map = None
+
+    def tele_at(t):
+        fit_ts = map_video_to_fit(t, groups)
+        return interpolate_fit(points, fit_ts)
+
+    total_frames = int(duration * FPS)
+
+    for frame in range(total_frames):
+        t0 = frame / FPS
+        tele = tele_at(t0)
+        lat = tele["lat"]
+        lon = tele["lon"]
+
+        if lat is None or lon is None:
+            map_img = last_map ##Image.new("RGBA", (MAP_SIZE, MAP_SIZE), (0, 0, 0))
+        else:
+            current_sec = int(t0)
+            if last_map is None or current_sec != last_map_second:
+                last_map = render_map(lat, lon, points)
+                last_map_second = current_sec
+            map_img = last_map
+
+        frame_bytes = map_img.convert("RGBA").tobytes()
+        process.stdin.write(frame_bytes)
+
+    process.stdin.close()
+
+# ------------------------------------------------------------
 # MAIN PIPELINE
 # ------------------------------------------------------------
 
@@ -605,21 +552,16 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     with marker_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # NEW FORMAT
     if isinstance(data, dict):
         saved_video = data.get("video_file")
         markers = data.get("markers", [])
-
         if saved_video != video_path.name:
             print(f"Sync markers belong to different video ({saved_video}), ignoring.")
             sync_markers = []
         else:
             sync_markers = markers
-
-    # OLD FORMAT (raw list)
     elif isinstance(data, list):
         sync_markers = data
-
     else:
         print("Unknown sync marker format, ignoring.")
         sync_markers = []
@@ -639,31 +581,45 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     if PREVIEW_SECONDS is not None:
         print(f"PREVIEW MODE: encoding first {PREVIEW_SECONDS} seconds")
         t_limit = PREVIEW_SECONDS
-        use_ass = False
+        use_ass = True
     else:
         t_limit = duration
         use_ass = True
 
     print("Starting ffmpeg…")
     ass_path = (OVERLAY_DIR / ASS_FILE)
-    #vf_arg = f"subtitles=filename={ass_path.as_posix()}"
-    #vf_arg = "".join(vf_arg.splitlines())
-    #print("ASS FILE CONTENTS:\n", ass_path.read_text(encoding="utf-8")[:200])
+
+    map_w = MAP_SIZE
+    map_h = MAP_SIZE
+
+    overlay_x = WIDTH - MAP_SIZE - 50
+    overlay_y = 50
+
+    overlay_filter = (
+        f"[1:v]fps=30,scale={MAP_DISPLAY_SIZE}:{MAP_DISPLAY_SIZE}[map30];"
+        f"[0:v][map30]overlay={overlay_x}:{overlay_y}[sub];"
+        f"[sub]subtitles={ass_path.as_posix().replace(':','\\\\:')}"
+    )
+
+
+    ffmpeg_path = r"D:\Users\dylix\source\repos\GoPro\Overlay\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe"
 
     if use_ass:
         ffmpeg_cmd = [
-            r"D:\Users\dylix\source\repos\GoPro\Overlay\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe",
+            ffmpeg_path,
             "-y",
             "-progress", "pipe:1",
             "-nostats",
 
-            "-i", str(video_path),              # 30 fps GoPro video
-            "-framerate", "1",                  # map is 1 fps
-            "-i", "map_frames/map_%06d.png",    # 1 fps map sequence
+            "-i", str(video_path),
 
-            "-filter_complex",
-            "[1:v]fps=30[map30];[0:v][map30]overlay=main_w-1000-50:50[sub];"
-            f"[sub]subtitles={ass_path.as_posix().replace(':','\\\\:')}",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgba",
+            "-s", f"{map_w}x{map_h}",
+            "-r", str(FPS),
+            "-i", "-",
+
+            "-filter_complex", overlay_filter,
 
             "-c:v", "h264_nvenc",
             "-preset", "p5",
@@ -675,7 +631,7 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
         ]
     else:
         ffmpeg_cmd = [
-            r"D:\Users\dylix\source\repos\GoPro\Overlay\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe",
+            ffmpeg_path,
             "-y",
             "-progress", "pipe:1",
             "-nostats",
@@ -688,37 +644,35 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
             "-t", str(t_limit),
             str(output_mp4),
         ]
-    #print("ARGV:", ffmpeg_cmd)
 
-    #print(" ".join(ffmpeg_cmd))
+    PID_FILE = Path(__file__).resolve().parent / "ffmpeg_pid.json"
 
-    # ------------------------------------------------------------
-    # REAL-TIME FFMPEG PROGRESS OUTPUT FOR GUI
-    # ------------------------------------------------------------
     process = subprocess.Popen(
         ffmpeg_cmd,
-        stdout=subprocess.PIPE,
+        stdin=subprocess.PIPE,        # binary pipe
+        stdout=subprocess.PIPE,       # still fine
         stderr=subprocess.STDOUT,
-        bufsize=1,
-        universal_newlines=True,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP  # ffmpeg gets its own group
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
     )
 
-    #print("OVERLAY_DIR:", OVERLAY_DIR)
-    #print("PID FILE PATH:", OVERLAY_DIR / "ffmpeg_pid.json")
-    #print("DIR EXISTS:", (OVERLAY_DIR).exists())
-    #print("CWD:", os.getcwd())
-    # Write PID immediately
     PID_FILE.write_text(json.dumps({"pid": process.pid}))
 
-    for line in process.stdout:
-        line = line.strip()
-        print(line)          # GUI sees this live
-        sys.stdout.flush()   # CRITICAL for real-time updates
+    def stream_thread():
+        stream_maps(raw_points, t_limit, groups, process)
 
+    t = threading.Thread(target=stream_thread)
+    t.start()
+
+    for line in process.stdout:
+        print(line.strip())
+        sys.stdout.flush()
+
+    t.join()
     process.wait()
 
     print("Done. Final MP4 written to", output_mp4)
+
+
 
 
 # ------------------------------------------------------------
@@ -726,11 +680,19 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
 # ------------------------------------------------------------
 
 if __name__ == "__main__":
-    base_video = Path(find_base_video())
+    with open("sync_markers.json", "r", encoding="utf-8") as f:
+        markers = json.load(f)
+
+    # GUI chose this MP4
+    base_video = TODAY_DIR / markers["video_file"]
+
+    # JSON always matches the MP4 name
+    json_path = TODAY_DIR / f"{markers['video_file']}.meta.json"
+
+    # FIT: sync_fit.py always uses the first FIT file in the folder
     fit_path = find_fit_file()
-    json_path = find_json_file()
+
     output_mp4 = TODAY_DIR / generate_hashed_overlay_name(base_video).name
-    PID_FILE = Path(__file__).resolve().parent / "ffmpeg_pid.json"
 
     print(f"Detected video: {base_video}")
     print(f"Detected FIT:   {fit_path}")

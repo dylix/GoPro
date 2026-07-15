@@ -824,75 +824,7 @@ class SyncTool(QtWidgets.QWidget):
         pts.sort(key=lambda p: p[0])
         return pts
 
-    # ---------------------------------------------------------
-    # MAP (center on current marker)
-    # ---------------------------------------------------------
-    def build_map_html(self, marker_index: int) -> str:
-        marker_index = max(0, min(marker_index, len(self.fit_points) - 1))
-
-        lat0 = float(self.fit_points[marker_index][1])
-        lon0 = float(self.fit_points[marker_index][2])
-
-        # Base map
-        m = folium.Map(location=[lat0, lon0], zoom_start=16, control_scale=True)
-
-        # Polyline coordinates
-        coords = [(float(p[1]), float(p[2])) for p in self.fit_points]
-        poly = folium.PolyLine(coords, color="blue", weight=3, opacity=0.7)
-        poly.add_to(m)
-
-        # Initial marker
-        lat_m, lon_m = coords[marker_index]
-        marker = folium.CircleMarker(
-            location=(lat_m, lon_m),
-            radius=7,
-            color="red",
-            fill=True,
-            fill_color="red",
-            fill_opacity=1.0,
-        )
-        marker.add_to(m)
-
-        # Inject JS for persistent marker + smooth movement
-        m.get_root().html.add_child(folium.Element("""
-    <script>
-    var marker_ref = null;
-    var poly_ref = null;
-    var mapReady = false;
-
-    map.whenReady(function() {
-        mapReady = true;
-        if (window.pyReady) {
-            window.pyReady();
-        }
-    });
-
-    function initObjects() {{
-        // Polyline reference
-        poly_ref = poly_{poly.get_name()};
-
-        // Marker reference
-        marker_ref = marker_{marker.get_name()};
-    }}
-
-    function registerPythonReady() {
-        if (mapReady && window.pyReady) {
-            window.pyReady();
-        }
-    }
-
-    function moveMarker(lat, lng) {{
-        if (marker_ref) {{
-            marker_ref.setLatLng([lat, lng]);
-            map.panTo([lat, lng], {{animate: true, duration: 0.25}});
-        }}
-    }}
-
-    document.addEventListener("DOMContentLoaded", initObjects);
-    </script>
-    """))
-
-        return m.get_root().render()
+       # MAP - STATIC HTML
 
     def update_map(self, marker_index: int):
         if not self.map_ready:
@@ -1236,18 +1168,21 @@ def auto_detect_files():
         print("ERROR: No valid combined-*.mp4 file found (non-overlay).")
         sys.exit(1)
 
-    VIDEO_PATH = videos[0]
+    print("\nAvailable MP4 files:")
+    for i, v in enumerate(videos):
+        print(f"{i}: {Path(v).name}")
+
+    choice = int(input("\nSelect MP4 index: "))
+    VIDEO_PATH = videos[choice]
     base = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 
     # 2. Detect JSON loosely matching the video name
     json_candidates = [str(p) for p in TODAY_DIR.glob("*.json")]
 
-    # Prefer exact match first
     exact = [j for j in json_candidates if Path(j).stem.startswith(base)]
     if exact:
         META_PATH = exact[0]
     else:
-        # Fuzzy match: JSON contains the base video name
         fuzzy = [j for j in json_candidates if base in Path(j).stem]
         if fuzzy:
             META_PATH = fuzzy[0]
