@@ -468,10 +468,18 @@ def render_map(lat, lon, route_points, zoom=15, size=MAP_SIZE, tile_grid=MAP_TIL
         fy = y - cy
         return fx * TILE + TILE, fy * TILE + TILE
 
-    BREADCRUMB_SECONDS = 10
-    t_now = route_points[-1]["time"]
-    recent = [p for p in route_points if p["time"] >= t_now - BREADCRUMB_SECONDS]
-    trail_raw = [project_raw(p["lat"], p["lon"]) for p in recent if p["lat"] and p["lon"]]
+    # --- breadcrumb: last N valid GPS points ---
+    MAX_POINTS = 150  # tune this for trail length
+
+    recent = []
+    for p in route_points:
+        if p.get("lat") is not None and p.get("lon") is not None:
+            recent.append(p)
+        if len(recent) >= MAX_POINTS:
+            break
+
+    # Project raw trail points
+    trail_raw = [project_raw(p["lat"], p["lon"]) for p in recent]
 
     # Rider position in padded space
     px, py = project_raw(lat, lon)
@@ -496,12 +504,21 @@ def render_map(lat, lon, route_points, zoom=15, size=MAP_SIZE, tile_grid=MAP_TIL
     scale = size / view_size
     trail = [((x - left) * scale, (y - top) * scale) for (x, y) in trail_raw]
 
+    # Make trail thicker, longer, and easier to see
     if len(trail) > 1:
         steps = len(trail)
         for i in range(1, steps):
+            x1, y1 = trail[i - 1]
+            x2, y2 = trail[i]
+
+            # Skip points outside the viewport
+            if not (0 <= x1 <= size and 0 <= y1 <= size and
+                    0 <= x2 <= size and 0 <= y2 <= size):
+                continue
+
             alpha = int(255 * (i / steps))
-            color = (255, 255, 255, alpha)
-            draw.line([trail[i-1], trail[i]], fill=color, width=4)
+            color = (255, 0, 0, alpha)  # RED trail for visibility
+            draw.line([trail[i - 1], trail[i]], fill=color, width=8)
 
     # Dot ALWAYS centered in final image
     dot_x = size // 2
@@ -572,6 +589,10 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     raw_points = load_fit(fit_path)
     if not raw_points:
         raise SystemExit("No telemetry points found in FIT file.")
+    mid = len(raw_points) // 2
+    for p in raw_points[mid:mid+10]:
+        print(p)
+
 
     print("Loading chapter metadata…")
     with open(json_path, "r") as f:
