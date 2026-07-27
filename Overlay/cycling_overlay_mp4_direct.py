@@ -21,7 +21,7 @@ import threading
 FPS = 30
 WIDTH, HEIGHT = 3840, 2160
 
-PREVIEW_SECONDS = 10
+PREVIEW_SECONDS = None
 
 TODAY_DIR = Path(r"D:\GoPro\Today")
 OVERLAY_DIR = Path(r"D:\Users\dylix\source\repos\GoPro\Overlay")
@@ -345,6 +345,7 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
 
     lines = [header]
 
+    smoother = TelemetrySmoother(max_history=3)
     def tele_at(t):
         fit_ts = map_video_to_fit(t, groups)
         return interpolate_fit(points, fit_ts)
@@ -355,14 +356,25 @@ m 3019 1900 l 3559 1900 b 3599 1900 3599 1900 3599 1940 l 3599 2140 b 3599 2180 
 
         tele = tele_at(t0)
 
-        speed_mps = tele["speed"]
-        speed_mph = None if speed_mps is None else speed_mps * 2.23694
-        hr = tele["hr"]
-        cad = tele["cadence"]
-        power = tele["power"]
-        dist_m = tele["distance"]
-        elev_m = tele["altitude"]
-        moving_time = tele["moving_time"]
+        raw_speed_mps = tele["speed"]
+        raw_hr        = tele["hr"]
+        raw_cad       = tele["cadence"]
+        raw_power     = tele["power"]
+        raw_dist_m    = tele["distance"]
+        raw_elev_m    = tele["altitude"]
+        raw_mtime     = tele["moving_time"]
+
+        speed_mps   = smoother.smooth("speed",       raw_speed_mps)
+        hr          = smoother.smooth("hr",          raw_hr)
+        cad         = smoother.smooth("cadence",     raw_cad)
+        power       = smoother.smooth("power",       raw_power)
+        dist_m      = smoother.smooth("distance",    raw_dist_m)
+        elev_m      = smoother.smooth("altitude",    raw_elev_m)
+        moving_time = smoother.smooth("moving_time", raw_mtime)
+
+        speed_mph   = None if speed_mps is None else speed_mps * 2.23694
+        dist_miles  = None if dist_m   is None else dist_m * 0.000621371
+        elev_ft     = None if elev_m   is None else elev_m * 3.28084
 
         dist_miles = None if dist_m is None else dist_m * 0.000621371
         elev_ft = None if elev_m is None else elev_m * 3.28084
@@ -629,7 +641,6 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     print("Generating ASS HUD overlay…")
     ass_path = (OVERLAY_DIR / "hud_overlay.ass").resolve()
     generate_ass(raw_points, duration, ass_path, groups)
-
     if PREVIEW_SECONDS is not None:
         print(f"PREVIEW MODE: encoding first {PREVIEW_SECONDS} seconds")
         t_limit = PREVIEW_SECONDS
@@ -725,6 +736,30 @@ def main(video_path: Path, fit_path: Path, json_path: Path, output_mp4: Path):
     print("Done. Final MP4 written to", output_mp4)
 
 
+from collections import deque
+
+class TelemetrySmoother:
+    def __init__(self, max_history=3):
+        self.history = {}  # field -> deque of last non-None values
+        self.max_history = max_history
+
+    def smooth(self, field, value):
+        if field not in self.history:
+            self.history[field] = deque(maxlen=self.max_history)
+
+        buf = self.history[field]
+
+        # If we have a real value, store it and use it
+        if value is not None:
+            buf.append(value)
+            return value
+
+        # If value is None but we have history, reuse last good value
+        if buf:
+            return buf[-1]
+
+        # No history, still None
+        return None
 
 
 # ------------------------------------------------------------
